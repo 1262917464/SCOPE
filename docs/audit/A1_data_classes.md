@@ -1,8 +1,10 @@
 # A1 — 数据类（Color / Tone / Rect / Table / Font）白盒一致性审计
+> 注：本文写于 2026-10-27 仓库重构前；文中 `backup/` `unpacked/` `build/` `test/` `third_party/` 等路径现位于 `local/` 下，`src/rgss_*.c` 现为 `src/runtimes/rgss2/*.c`，`tools/` 已按流水线分桶（unpack/pe/analysis/probe/verify）。
+
 
 - 审计日期：2026-10-27（只读审计，未改动任何 src/ 文件）
 - 重建源码：`src/rgss_data_classes.c`
-- 原版参考：`docs/assets/rgss_ruby_api_map.tsv` + `build/full_disasm.txt`（objdump，基址 0x10000000）
+- 原版参考：`docs/analysis/rgss2/rgss_ruby_api_map.tsv` + `build/full_disasm.txt`（objdump，基址 0x10000000）
 - 方法：按 TSV 的 fn_va 逐函数解码汇编（数据类函数均不在 Hex-Rays 缓存内，全部读汇编）；关键常量/字符串用 `backup/RGSS202E.dll` 原始字节核对（数据段已加壳加密，字符串直接读取为乱码，故文本类常量标注"未验证"）。
 - 判定枚举：一致 / 等价（实现不同但行为同）/ 偏差 / 桩 / 未映射 / 无法验证
 

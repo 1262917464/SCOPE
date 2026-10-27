@@ -1,8 +1,10 @@
 # A2 审计 — Bitmap 类 + Marshal + 类注册链 + 内嵌源码
+> 注：本文写于 2026-10-27 仓库重构前；文中 `backup/` `unpacked/` `build/` `test/` `third_party/` 等路径现位于 `local/` 下，`src/rgss_*.c` 现为 `src/runtimes/rgss2/*.c`，`tools/` 已按流水线分桶（unpack/pe/analysis/probe/verify）。
+
 
 日期：2026-10-27 ｜ 方式：白盒只读审计（objdump 反汇编 + Hex-Rays 缓存 + 原版 DLL 数据段直读）
 对象：`src/rgss_bitmap.c`、`src/rgss_marshal.c`、`src/rgss_classes.c`、`src/rgss_embedded.c`
-对照：`docs/assets/rgss_ruby_api_map.tsv`（基址 0x10000000）、`build/full_disasm.txt`、`build/orig_pseudo/functions/`、`docs/M5-c_图形类注册链.md`、`docs/assets/embedded_rpg_classes.rb`
+对照：`docs/analysis/rgss2/rgss_ruby_api_map.tsv`（基址 0x10000000）、`build/full_disasm.txt`、`build/orig_pseudo/functions/`、`docs/analysis/rgss2/M5-c_图形类注册链.md`、`src/runtimes/rgss2/embedded/rpg_classes.rb`
 
 判定枚举：一致 / 等价 / 偏差（详述）/ 桩 / 未映射 / 无法验证
 
@@ -69,11 +71,11 @@ TSV 无对应行（全局函数不分类）。定位：原版伪代码缓存
 | Init_Bitmap 方法数 | 0x10006060 | **偏差** | 原版 22 方法 vs 重建 21（缺 initialize_copy，见 §1 末行）— 记 B-8 |
 | 两阶段触发时机 | — | 一致 | 重建 phase A 于 RGSSInitialize2（rgss_export.c:46）、phase B 于 RGSSGameMain 开头（rgss_gamemain.c:250，对应原版 CGameFrame::Run 首步），与 docs/M5-c 的延迟注册模型一致 |
 
-## 4. 内嵌源码注入（src/rgss_embedded.c vs docs/assets/embedded_rpg_classes.rb）
+## 4. 内嵌源码注入（src/rgss_embedded.c vs src/runtimes/rgss2/embedded/rpg_classes.rb）
 
 | 条目 | 原版地址 | 判定 | 证据摘要 |
 |------|----------|------|----------|
-| 内嵌 blob 内容 | 0x100FF650 | 一致 | 原版 DLL `unpacked/RGSS202E_unpacked.dll` 文件偏移 0xFF650 起的 NUL 结尾 C 串，长度 **18213 字节**，与 `docs/assets/embedded_rpg_classes.rb`（18213 字节）**逐字节相等**（py 比对 exact equal: True），`module RPG;class Map;def initialize(width, height);…` 起始一致 |
+| 内嵌 blob 内容 | 0x100FF650 | 一致 | 原版 DLL `unpacked/RGSS202E_unpacked.dll` 文件偏移 0xFF650 起的 NUL 结尾 C 串，长度 **18213 字节**，与 `src/runtimes/rgss2/embedded/rpg_classes.rb`（18213 字节）**逐字节相等**（py 比对 exact equal: True），`module RPG;class Map;def initialize(width, height);…` 起始一致 |
 | 注入时机/方式 | 0x10009E60 末尾→0x1000345C | 等价 | 原版：阶段 A 末尾 sub_100330A0(off_1015B044[0]→0x100FF650) eval（0x10009e60.c 末行）。重建 rgss_embedded.c:12-24：objcopy 符号取 start/end，malloc 拷贝 + rb_eval_string_protect，在 rgss_classes.c:66-68 phase A 末尾调用，时机一致。差异：原版经 eval helper（sub_10008A80，3 参形式），重建 rb_eval_string_protect 直调；失败时重建静默返回 0，无异常上抛 — 观察面等价 |
 | 注入内容大小上限 | — | 等价 | 重建 len>1MB 拒绝（:15），原版 blob 18KB 远小于上限，无实际影响 |
 

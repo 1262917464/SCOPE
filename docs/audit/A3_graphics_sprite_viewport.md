@@ -1,8 +1,10 @@
 # A3 — Graphics / Sprite / Viewport 与原版二进制逻辑一致性审计
+> 注：本文写于 2026-10-27 仓库重构前；文中 `backup/` `unpacked/` `build/` `test/` `third_party/` 等路径现位于 `local/` 下，`src/rgss_*.c` 现为 `src/runtimes/rgss2/*.c`，`tools/` 已按流水线分桶（unpack/pe/analysis/probe/verify）。
+
 
 - 审计日期: 2026-10-27
 - 对比材料: `build/full_disasm.txt`(原版 objdump, 基址 0x10000000, 脱壳版),
-  `docs/assets/rgss_ruby_api_map.tsv`(97 条), 字符串证据取自
+  `docs/analysis/rgss2/rgss_ruby_api_map.tsv`(97 条), 字符串证据取自
   `unpacked/RGSS202E_unpacked.dll`(.rdata 直接读取)。
 - 重建源码: `src/rgss_graphics_classes.c`, `src/rgss_render.c`, `src/rgss_gamemain.c`(只读审计, 未改动)。
 - 方法: 逐条按 TSV 地址读原版反汇编, 与重建实现对照。原版通用约定(适用于全部条目):

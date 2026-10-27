@@ -1,8 +1,10 @@
 # A4 — Tilemap / Window / Plane 与原版二进制逻辑一致性审计
+> 注：本文写于 2026-10-27 仓库重构前；文中 `backup/` `unpacked/` `build/` `test/` `third_party/` 等路径现位于 `local/` 下，`src/rgss_*.c` 现为 `src/runtimes/rgss2/*.c`，`tools/` 已按流水线分桶（unpack/pe/analysis/probe/verify）。
+
 
 - 审计日期: 2026-10-27
 - 对比材料: `build/full_disasm.txt`(原版 objdump, 基址 0x10000000, 脱壳版),
-  `docs/assets/rgss_ruby_api_map.tsv`(97 条), Hex-Rays 伪代码缓存
+  `docs/analysis/rgss2/rgss_ruby_api_map.tsv`(97 条), Hex-Rays 伪代码缓存
   `build/orig_pseudo/functions/0x1000b4xx-0x1000bexx.c`(Plane 21 个函数), 字符串/表格数据直接取自
   `unpacked/RGSS202E_unpacked.dll`(PE 节表: 第 1 节 raw==va, 故 .data VA 即文件偏移)。
 - 重建源码: `src/rgss_graphics_classes.c`, `src/rgss_render.c`(只读审计, 未改动)。

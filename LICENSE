@@ -1,0 +1,15 @@
+Copyright (c) 2026 SCOPE project authors (仓库作者). All rights reserved.
+
+1. 本仓库内的重建源码（src/）、构建脚本（src/mk/、各 Makefile）、工具源码（tools/）
+   与文档（docs/）的版权归仓库作者所有。未经书面许可，不得复制、修改、再分发或商用。
+   本许可为"保留所有权利"（All Rights Reserved），公开仓库仅表示可阅读、供研究参考。
+
+2. 本仓库不包含、也不分发任何 Enterbrain / RPG Maker 的原始二进制、游戏数据、
+   美术或音频素材。此类文件位于不入库的 local/ 工作台，仅限持有正版者自备；
+   获取方式与著作权边界见 README「仓库边界」一节。
+
+3. docs/ 中记录的事实性内容（内存布局、函数地址、IAT 映射、文件格式、调用约定等）
+   是对第三方软件行为的客观观察记录，本身不作为受版权保护的创作物主张权利。
+
+4. local/third_party/ 下的 Ruby 上游源码（1.8.1 / 1.9.2-p0）按 Ruby License 释出，
+   取法与 SHA-256 校验值见 docs/analysis/common/third_party.md。

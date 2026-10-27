@@ -1,4 +1,6 @@
 # A5 白盒审计 — Input / Audio / 生命周期导出 / 主循环
+> 注：本文写于 2026-10-27 仓库重构前；文中 `backup/` `unpacked/` `build/` `test/` `third_party/` 等路径现位于 `local/` 下，`src/rgss_*.c` 现为 `src/runtimes/rgss2/*.c`，`tools/` 已按流水线分桶（unpack/pe/analysis/probe/verify）。
+
 
 日期: 2026-10-27 ｜ 方式: 重建源码 (src/) vs 原版反汇编 (build/full_disasm.txt, 基址 0x10000000) + Hex-Rays 缓存 (build/orig_pseudo/functions/)
 范围: TSV class ∈ {Input, Audio} 全部条目、rgss_export.c 生命周期导出、rgss_gamemain.c 主循环、rgss_regex_stubs.c 正则导出。只读审计, 未改动 src/。
