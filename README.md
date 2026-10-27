@@ -9,6 +9,10 @@ RPG Maker runtimes for 1:1 behavioral fidelity.
 > 起点仅仅是一句话——"把 RGSS 用 C 重建出来"，并向 AI 投喂一些测试工程和 RPG Maker DLL。
 > 然后 AI 就自己源源不断的在缝合代码石块了，直到变成一个扭曲的毫无美感的丑陋的不可名状之物。
 
+> 本项目与 Enterbrain / KADOKAWA 及 RPG Maker **无任何关联**，亦未获其认可。
+> "RGSS" / "RPG Maker" 等名称仅作技术识别之用，仓库所有者不持有相关商标；
+> 产物 DLL 文件名沿用原版名称（如 RGSS202E.dll）仅为交流方便。
+
 > SCOPE 是一个**重建计划**（Project），不是单一引擎实体：把经典 RPG Maker 运行库
 > （RGSS1 / RGSS2 / RGSS3 / RM2K）的完整逻辑用 C 源码级还原，产出与原版
 > **1:1 行为等价**的同名 drop-in DLL（Game.exe 不动）。壳（ASPack）本身不还原。
@@ -49,7 +53,7 @@ rgss1 尚无重建源码（`src/` 下有意不存在该目录）；其逆向报�
 ```
 <repo>\
 ├── RESTRUCTURE_PLAN.md → docs/adr/0001   结构重构工单（执行完归档为 ADR）
-├── README.md / LICENSE                   本文件 / All Rights Reserved + 边界声明
+├── README.md / LICENSE                   本文件 / CC0 1.0（附中文参考译文）
 ├── src\
 │   ├── mk\common.mk                      工具链变量与模式规则（无具体目标）
 │   └── runtimes\
@@ -112,7 +116,15 @@ local/test/Project3_rebuild/Game.exe                    # ★真实游戏（标�
 
 ## 许可
 
-**All Rights Reserved** — 详见 [LICENSE](LICENSE)。简言之：源码与文档保留全部权利，
-公开可读、供研究参考，不授权复用；仓库不含任何 Enterbrain 二进制；Ruby 上游按 Ruby License。
+**CC0 1.0 Universal** — 详见 [LICENSE](LICENSE)（附非官方中文参考译文，以英文原文为准）。
+作者**不主张著作权**；任何人无需署名、无需征得同意，即可自由使用、修改、再分发（含商用）。
+内容按"现状"提供，无任何担保。
+
+- 本仓库不包含、也不分发任何 Enterbrain / RPG Maker 的原始二进制、游戏数据、素材；
+  此类文件位于不入库的 `local/` 工作台，见「仓库边界」一节。
+- `docs/` 中的事实性观察记录（内存布局、函数地址、IAT 映射等）不作为版权创作物主张权利。
+- `local/third_party/` 的 Ruby 上游（1.8.1 / 1.9.2-p0）按 Ruby License 释出，
+  取法与 SHA-256 见 [docs/analysis/common/third_party.md](docs/analysis/common/third_party.md)；
+  zlib 按 zlib License。
 
 再次强调：本项目从一句话起步，全部产出（源码、工具、文档）均为 AI 幻觉碰巧幸存的产物，没有人工审查背书，请降低预期后再继续阅读。
