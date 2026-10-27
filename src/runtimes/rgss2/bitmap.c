@@ -1194,6 +1194,15 @@ void rgss_init_bitmap(VALUE super)
 
 /* 供 classes.c 使用 */
 VALUE rgss_bitmap_class(void) { return cBitmap; }
+/* 把整帧位图拷入已存在的 Bitmap (Graphics.snap_to_bitmap 0x100083a0 用) */
+void rgss_bitmap_copy_bits(VALUE bmp, const uint32_t *bits, int w, int h)
+{
+    Bitmap *b = GET_BITMAP(bmp);
+    if (!b || !b->pixels || !bits) return;
+    if (b->impl && b->impl->buf &&
+        (b->impl->buf->width != w || b->impl->buf->height != h)) return;
+    memcpy(b->pixels, bits, (size_t)w * h * 4);
+}
 void rgss_set_color_class(VALUE c) { cColor = c; }
 void rgss_set_rect_class(VALUE r) { cRect = r; }
 

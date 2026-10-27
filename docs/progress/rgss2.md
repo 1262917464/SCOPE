@@ -8,7 +8,7 @@
 | 里程碑 | 内容 | 状态 |
 |--------|------|------|
 | M1–M4 | 脱壳 → 模块地图 → Ruby 1.8.1 集成 → 对象层主干 | ✅ 完成 |
-| M5-a…M5-k | 主循环 / Init / 两阶段注册 / Bitmap / Scripts / 骨架 / 数据类 / 渲染 / 输入 / 字体 / draw_text | ✅ 完成 |
+| M5-a…M5-m | 主循环 / Init / 两阶段注册 / Bitmap / Scripts / 骨架 / 数据类 / 渲染 / 输入 / 字体 / draw_text / 转场与 fade | ✅ 完成 |
 | M5-k* | 文字混合器白盒还原（F[a]=a+1 查表式，阴影偏淡修正）+ 字体集合截断修复 | ✅ 完成 |
 | M5-l | review+整修线：RGSSGameMain 对齐（F12 Reset / $TEST / 主循环架构 / B49 清理链 / B43 exit 0 / B44 日志改造+崩溃转储） | ✅ 完成（2026-10-28，销账见差异清单 §四） |
 | M6 | 自动对照测试 + 研究文档 + 地址映射表 | ⬜ 未开始 |
@@ -28,7 +28,8 @@
 1. `IsWindowVisible` 定名 85% 置信 → M6 长会话探针可最终确认。
 2. JPEG 解码器具体库（版本串 "2.0.8"）、Ogg 版本串 "0.6.0" 对号。
 3. Enterbrain 对 Ruby 1.8.1 的本地补丁范围（M3 对拍 5 条全一致，M6 需全量电池）。
-4. `transition` 淡入淡出未实现（当前直接切帧）。
+4. ~~`transition` 淡入淡出~~（M5-m 已完成：freeze/transition/fadein/fadeout
+   按原版语义实装；文件转场遮罩着色器未解码，暂退化 crossfade，见 M5-m §七）。
 5. **自动图块 48 形状 → 四分之一片映射表未还原**（当前用邻接近似）。
    已实测锚点：id 2048→kind42→A1#10=深海；id 1537→kind32→A1#0=海滩；
    kind 0-31→TileA2，32-47→TileA1，48-79→TileA3，80+→TileA4。
@@ -40,7 +41,6 @@
 
 1. 自动图块 48 形状表（见上 §未决 5，反汇编原版 Tilemap 绘制函数取 48 形状 → 2x3 块 6 片精确映射）。
 2. 音频：MCI（winmm）BGM/ME + SE。
-3. `transition` 淡入淡出。
 4. ~~帧率限制~~（QueryPerformanceCounter 已完成）；~~draw_text 自绘~~（M5-j 已完成）。
 
 ## 已沉淀的专题文档（不再在本看板重复）
@@ -50,6 +50,7 @@
 | 字体系统逆向（IAT 实测 + 两段式字体创建 + 地址标注） | `docs/analysis/rgss2/M5-i_字体系统逆向.md` |
 | draw_text 自绘字形光栅化（GGO + REPLACE + per-pixel alpha） | `docs/analysis/rgss2/M5-j_draw_text逆向.md` |
 | 字体创建与字体名选择修正（含 48 形状表前置知识） | `docs/reports/rgss2/M5-k_字体创建逆向修正.md` |
+| Graphics 转场与 fade（freeze/transition/fadein/fadeout 逐指令还原） | `docs/reports/rgss2/M5-m_Graphics转场与fade逆向.md` |
 | 45 条缺陷 + Ruby C API 陷阱 | `docs/analysis/rgss2/pitfalls.md` |
 | Game.exe 调用契约 / Bitmap 布局 / 两阶段注册 | `docs/analysis/rgss2/` 各 spec |
 | 一致性审计（A1–A5 + 总报告） | `docs/audit/` |

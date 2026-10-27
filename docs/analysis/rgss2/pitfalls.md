@@ -1,11 +1,11 @@
-# RGSS2 重建踩坑记录 — 缺陷 45 条 + Ruby 1.8.1 C API 陷阱
+# RGSS2 重建踩坑记录 — 缺陷 49 条 + Ruby 1.8.1 C API 陷阱
 
 > 提取自重构前的根 `PROGRESS.md` §五（2026-10-27），属**长期参考事实**：
 > 绝大多数条目记录的是"原版 Ruby 1.8.1 / RGSS 语义的客观陷阱"，即使日后重写实现也依然成立。
 > 与 `docs/audit/` 的区别：审计是某次快照的判定（会过期），这里是可复用的经验事实。
 > 编号与原 PROGRESS.md 保持一致，外部引用（如代码注释"按主人决策 1"）以本文件为锚。
 
-## 缺陷表（45 条）
+## 缺陷表（49 条）
 
 | # | 问题 | 症状 | 修复 |
 |---|------|------|------|
@@ -56,6 +56,8 @@
 | 45 | **★字体族集合容器只有 40 槽, 枚举出 5570 个族 → 截断★** | **字体实际回退成宋体 (req≠actual), 字形完全不对** | 容器扩到 16384。截断导致查不到的名字被判"可用" (fail-open), 直接交给 GDI 后静默回退宋体。修正后 req=actual=霞鹜文楷屏幕阅读版R, cellX=17 与原版字距一致 |
 | 46 | **★文字混合用 a/255 权重的 REPLACE/over, 而非原版 F[a]=a+1 查表式★** | **阴影明显偏淡** (暗环带 B 通道 121.8 vs 原版 93.0, 最暗点 53.7 vs 32.6) | 照原版混合器精确还原 (见 M5-k §八): `out_c = dst_c + (src_c−dst_c)×F[a]>>8` 四通道, F[0]=0/F[a]=a+1 (0x100A9790 初始化), 字体 alpha 走 src 的 alpha 通道。修正后暗环带 96.1 vs 93.0, 最暗点 35.1 vs 32.6 (残差来自窗口背景 +9B 偏差), 近白像素比 0.997 |
 | 47 | **★contents→屏幕合成用直通 alpha, 源色未按字体 alpha 预乘★** | **文字边缘偏瘦** (f² 双重乘, 字芯 131 vs 175); 禁用项饱和 255 vs 155 | 原版管线: 混合器对透明 dst 产出预乘值 (rgb=src×f, a=f), 源色 tile 由同一混合器生成 (rgb 已按 fa 预乘), contents→屏幕为预乘 over (screen=rgb+dst×(1−a))。实现: write_over 源色预乘 + render_blit 内部 mode 3 (预乘 over, 仅 contents 合成)。**mode 3 必须钳制** (预乘 rgb + bg 残余 >255, 溢出致禁用项变黄) |
+| 48 | **★argc=-1 注册的 C 函数写成 (m, argc, argv) 签名★** | transition 一调即 ArgumentError, argc 读到 self 指针 (8558256) | Ruby 约定: argc=-1 时以 func(int argc, VALUE *argv, VALUE self) 调用, self 是**最后一个**参数 |
+| 49 | **★Window/Plane/Tilemap 的 dispose 是空操作, compose 也不查 disposed★** | Scene_Menu#terminate 后 @status_window 永久停留在画面上 | dispose 置 disposed=1+visible=0 并脱离注册表; compose 各层跳过 disposed (Sprite/Viewport 原本就有, 补齐 Window/Plane/Tilemap) |
 
 ## Ruby 1.8.1 C API 陷阱（写代码必看）
 

@@ -221,6 +221,15 @@ exception:
         VALUE err = rb_gv_get("$!");
         if (!NIL_P(err)) {
             const char *cname = rb_obj_classname(err);
+            {   /* 诊断: 异常落盘 (临时, 走标准日志出口) */
+                FILE *f = RGSS_LOG_FOPEN("rgss_error.log");
+                if (f) {
+                    VALUE msg = rb_funcall(err, rb_intern("message"), 0);
+                    fprintf(f, "exc=%s msg=%s\n", cname ? cname : "?",
+                            NIL_P(msg) ? "?" : RSTRING(msg)->ptr);
+                    fclose(f);
+                }
+            }
             if (cname != NULL && strcmp(cname, "Reset") == 0) {
                 rgss_cleanup_pass();
                 return 1;

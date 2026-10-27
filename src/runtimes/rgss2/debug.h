@@ -33,7 +33,7 @@ static inline void rgss_debug_cleanup(void) { (void)0; }
 static const char *const rgss_debug_log_names[] = {
     "rgss_text.log", "rgss_phase.log", "rgss_render.log", "rgss_caller.log",
     "rgss_input.log", "rgss_window.log", "rgss_tilemap.log", "rgss_init.log",
-    "rgss_rebuild.log", "rgss_trace.log", "rgss_crash.log", "dbg.txt", NULL
+    "rgss_rebuild.log", "rgss_trace.log", "rgss_crash.log", "rgss_error.log", "dbg.txt", NULL
 };
 
 #endif /* RGSS_DEBUG_H */

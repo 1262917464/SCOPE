@@ -34,7 +34,21 @@ static void tilemap_free2(void *p);
 static int   g_frame_rate = 60;
 static int   g_frame_count = 0;
 static int   g_brightness = 255;
-static int   g_frozen = 0;
+/* 转场/黑幕状态。
+ * 原版布局（0x1016efe4 单例）:
+ *   +0x250 全屏黑幕精灵, 其属性 0x10 = 黑幕强度 0..255 (=255-brightness,
+ *          brightness= 0x10007d90 钳制后写 255-v, 0x10014770)
+ *   +0x254 转场源纹理 (freeze 时 0x10095ba0/0x10095bf0 抓当前帧)
+ *   +0x258 渲染器: 0x1009a280 写 14-dword 转场参数块, vtable+4(1/0) 进出转场模式
+ *   +0x25c 转场位图, transition 尾声 0x10013c40 释放 (0x100086c0 亦然) */
+static int   g_fade_level = 0;        /* 黑幕强度, 原版 +0x250 prop 0x10 */
+static int   g_transition_mode = 0;   /* 原版 vtable+4(1) 后处于转场显示 */
+static int   g_frozen_active = 0;     /* freeze 置位, transition 结束清除 */
+static int   g_frozen_alpha = 255;    /* 转场中冻结图权重 0..255 */
+static uint32_t *g_freeze_bits = NULL; /* +0x254 快照 */
+static int   g_freeze_w = 0, g_freeze_h = 0;
+static uint32_t *g_mask_bits = NULL;  /* 文件转场遮罩亮度 0..255 */
+static int   g_mask_w = 0, g_mask_h = 0, g_mask_vague = 40;
 static int   g_screen_w = 544, g_screen_h = 416;
 static HWND  g_hwnd;
 
@@ -51,6 +65,7 @@ void rgss_render_blit(const SrcSurface *src, int dst_x, int dst_y,
                       int src_x, int src_y, int src_w, int src_h,
                       int dst_w, int dst_h, int opacity, int blend_type);
 extern VALUE rgss_bitmap_class(void);
+extern void rgss_bitmap_copy_bits(VALUE bmp, const uint32_t *bits, int w, int h);
 
 /* ================= Graphics ================= */
 long rgss_sprite_count_dbg(void);
@@ -68,18 +83,64 @@ static void gfx_window_close_check(void)
     if (!g_hwnd || !IsWindow(g_hwnd))
         rb_raise(rb_eSystemExit, "exit");
 }
-static VALUE gfx_update(VALUE mod)
+/* 帧步进末端显示规则。
+ * 原版: 0x10001890 渲染末段, +0x258 渲染器持有转场参数块 (0x1009a280 写入 +0x8c):
+ *  - freeze(0x10007bb0) 抓帧到 +0x254 后 vtable+4(1) 进转场显示, 画面静止
+ *  - transition(0x10007fb0) 默认环 0x100082a0: 冻结图权重 255-(i+1)*255/dur 线性降 0
+ *  - 黑幕 +0x250 精灵 prop 0x10 (0x10014770), 值 = 255-brightness (0x10007d90) */
+static void gfx_capture_freeze(void)
 {
-    (void)mod;
-    rgss_f12_check();
-    MSG msg;
-    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    int w = rgss_render_width(), h = rgss_render_height();
+    uint32_t *bits = (uint32_t *)rgss_render_get_bits();
+    if (!bits || w <= 0 || h <= 0) return;
+    if (g_freeze_w != w || g_freeze_h != h) {
+        free(g_freeze_bits);
+        g_freeze_bits = (uint32_t *)malloc((size_t)w * h * 4);
+        g_freeze_w = w; g_freeze_h = h;
     }
-    gfx_window_close_check();   /* 原版 0x10007b31: !frame_update → exit 0 */
-    /* 帧率限制: 原版按 frame_rate 限帧 (默认 60)。
-     * 没有限帧时游戏跑满 CPU, 且光标闪烁等帧同步效果完全失真 */
+    if (g_freeze_bits)
+        memcpy(g_freeze_bits, bits, (size_t)w * h * 4);
+}
+static void gfx_apply_display_rule(void)
+{
+    uint32_t *bits = (uint32_t *)rgss_render_get_bits();
+    if (!bits) return;
+    int w = rgss_render_width(), h = rgss_render_height(), n = w * h;
+    int a = 0;
+    if (g_frozen_active && g_freeze_bits && g_freeze_w == w && g_freeze_h == h)
+        a = g_transition_mode ? g_frozen_alpha : 255;
+    if (a >= 255) {
+        memcpy(bits, g_freeze_bits, (size_t)n * 4);
+    } else if (a > 0) {
+        for (int i = 0; i < n; i++) {
+            uint32_t f = g_freeze_bits[i], l = bits[i];
+            uint32_t r = ((f >> 16 & 255) * a + (l >> 16 & 255) * (255 - a)) / 255;
+            uint32_t g = ((f >>  8 & 255) * a + (l >>  8 & 255) * (255 - a)) / 255;
+            uint32_t b = ((f       & 255) * a + (l       & 255) * (255 - a)) / 255;
+            bits[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+    int L = g_fade_level;   /* 黑幕强度; 原版遮罩绘制在转场层之上 */
+    if (L < 0) L = 0;
+    if (L > 255) L = 255;
+    if (L > 0) {
+        int k = 255 - L;
+        for (int i = 0; i < n; i++) {
+            uint32_t p = bits[i];
+            uint32_t r = (p >> 16 & 255) * k / 255;
+            uint32_t g = (p >>  8 & 255) * k / 255;
+            uint32_t b = (p       & 255) * k / 255;
+            bits[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+/* 帧步进单元: 原版一次 0x10001640(限帧) + 0x100014a0(F12) + 0x10001890
+ * (帧计数自增 0x10001946 / 合成 / 显示 / 关窗检查)。
+ * update/wait/fadeout/fadein/transition 的每一帧都走这个组合。 */
+static void gfx_step_frame(void)
+{
+    rgss_f12_check();
+    gfx_window_close_check();
     {
         static int limiter_init = 0;
         static LARGE_INTEGER qpf, next;
@@ -100,15 +161,24 @@ static VALUE gfx_update(VALUE mod)
                 if (now.QuadPart >= next.QuadPart) break;
             }
         } else {
-            /* 落后过多: 重新对齐, 不追帧 */
             next.QuadPart = now.QuadPart + step;
         }
     }
-    /* 注意: Graphics.freeze 只是快照当前画面用于转场, 不停止 update */
     g_frame_count++;
     rgss_render_clear(0xFF000000u);
     rgss_compose_scene();
+    gfx_apply_display_rule();
     rgss_render_present();
+}
+static VALUE gfx_update(VALUE mod)
+{
+    (void)mod;
+    MSG msg;
+    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    gfx_step_frame();
     if (g_frame_count <= 3 || (g_frame_count % 60) == 0) {
         FILE *f = RGSS_LOG_FOPEN("rgss_render.log");
         if (f) { fprintf(f, "[gfx] frame=%d bits=%p sprites=%d win=0x%X\n",
@@ -129,7 +199,16 @@ static VALUE gfx_update(VALUE mod)
 }
 
 static VALUE gfx_frame_rate(VALUE m) { (void)m; return INT2FIX(g_frame_rate); }
-static VALUE gfx_frame_rate_set(VALUE m, VALUE v) { (void)m; g_frame_rate = NUM2INT(v); return v; }
+/* 原版 0x10007ce0: 值 <=10 → 10, >120 → 120 后写入 +0x214 (0x100015f0) */
+static VALUE gfx_frame_rate_set(VALUE m, VALUE v)
+{
+    (void)m;
+    int n = NUM2INT(v);
+    if (n <= 10)  n = 10;
+    if (n > 120)  n = 120;
+    g_frame_rate = n;
+    return v;
+}
 static VALUE gfx_frame_count(VALUE m) { (void)m; return INT2FIX(g_frame_count); }
 static VALUE gfx_frame_count_set(VALUE m, VALUE v)
 {
@@ -138,51 +217,115 @@ static VALUE gfx_frame_count_set(VALUE m, VALUE v)
     return INT2FIX(g_frame_count);
 }
 static VALUE gfx_frame_reset(VALUE m) { (void)m; g_frame_count = 0; return Qnil; }
+/* 原版 getter 0x10008460 / setter 0x10007d90:
+ * setter 钳制 0..255 后向 +0x250 精灵写 255-v (prop 0x10, 0x10014770)。
+ * 黑幕强度 g_fade_level 即 255-brightness, fadeout/fadein 直接改它。 */
 static VALUE gfx_brightness(VALUE m) { (void)m; return INT2FIX(g_brightness); }
-static VALUE gfx_brightness_set(VALUE m, VALUE v) { (void)m; g_brightness = NUM2INT(v); return v; }
-/* freeze: 保存当前画面快照（供 transition 淡入淡出使用） */
+static VALUE gfx_brightness_set(VALUE m, VALUE v)
+{
+    (void)m;
+    int n = NUM2INT(v);
+    if (n < 0) n = 0;
+    if (n > 255) n = 255;
+    g_brightness = n;
+    g_fade_level = 255 - n;
+    return v;
+}
+/* freeze (原版 0x10007bb0): 0x10095ba0/0x10095bf0 抓当前帧到 +0x254,
+ * 0x10098a10(+0x244,0) 隐藏实况层, vtable+4(1) 进转场显示 → 画面静止 */
 static VALUE gfx_freeze(VALUE m)
 {
     (void)m;
-    g_frozen = 1;
-    /* TODO: 把后缓冲拷到独立快照缓冲, 供 transition 使用 */
+    gfx_capture_freeze();
+    g_frozen_active = 1;
+    g_transition_mode = 1;
+    g_frozen_alpha = 255;
     return Qnil;
 }
-static VALUE gfx_transition(VALUE m, int argc, VALUE *argv)
+/* transition (原版 0x10007fb0, argc=-1):
+ * argc>3 → ArgumentError (0x10008f20);
+ * duration 默认 10 (0x1000804d), filename 默认 "" (0x10008052),
+ * vague 默认 0x28 (0x10008057);
+ * 进转场 vtable+4(1) (0x100080b8), 黑幕清零 (0x100080d6);
+ * 无文件名: 默认环 0x100082a0, 每帧冻结权重 255-(i+1)*255/dur 线性降 0, 帧步进;
+ * 有文件名: 文件环 0x10008238, 遮罩着色器未解码 — 已知差异, 退化为同参数 crossfade;
+ * 尾声 vtable+4(0) (0x10008330), 释放转场资源 (0x1000833e)。
+ * argc=-1 注册: Ruby 以 func(argc, argv, self) 调用。 */
+static VALUE gfx_transition(int argc, VALUE *argv, VALUE self)
 {
-    (void)m; (void)argc; (void)argv;
-    gfx_update(m);
+    (void)self;
+    if (argc > 3)
+        rb_raise(rb_eArgError, "wrong number of arguments (%d for 0..3)", argc);
+    int duration = 10;
+    if (argc >= 1) duration = NUM2INT(argv[0]);
+    if (argc >= 2) rb_string_value_cstr(&argv[1]);   /* 字符串化, 对应 0x100808d0 */
+    if (!g_frozen_active)
+        gfx_capture_freeze();    /* 无 freeze 前置时以当前画面为转场源 */
+    g_transition_mode = 1;
+    g_fade_level = 0;            /* 0x10014770(+0x250,0x10,0) */
+    g_brightness = 255;
+    if (duration >= 1) {
+        for (int i = 0; i < duration; i++) {
+            g_frozen_alpha = 255 - ((i + 1) * 255) / duration;  /* 0x100082b4 */
+            gfx_step_frame();
+        }
+    }
+    g_transition_mode = 0;
+    g_frozen_active = 0;
     return Qnil;
 }
 static VALUE gfx_wait(VALUE m, VALUE vframes)
 {
     int n = NUM2INT(vframes);
-    for (int i = 0; i < n; i++) {
-        rgss_f12_check();
-        gfx_window_close_check();   /* 原版 0x10007b93: 每迭代检查 */
-        gfx_update(m);
-    }
+    for (int i = 0; i < n; i++)
+        gfx_step_frame();    /* 原版 0x10007b70: 限帧+F12+帧步进 */
     return Qnil;
 }
+/* fadeout (原版 0x10007e30): C=当前黑幕值(+0x250 遮罩块回读 [esp+0x44]);
+ * 每帧 C+(i+1)*(255-C)/dur (0x10007e80), dur<1 跳环 (0x10007e6e);
+ * 尾声置 255 (0x10007ecf)。 */
 static VALUE gfx_fadeout(VALUE m, VALUE vframes)
 {
-    (void)m; (void)vframes;
-    rgss_f12_check();       /* 原版 0x10007ea5 */
-    gfx_window_close_check();   /* 原版 0x10007eb9 */
+    (void)m;
+    int d = NUM2INT(vframes);
+    int C = g_fade_level;
+    if (d >= 1) {
+        for (int i = 0; i < d; i++) {
+            g_fade_level = C + ((i + 1) * (255 - C)) / d;
+            gfx_step_frame();
+        }
+    }
+    g_fade_level = 255;
+    g_brightness = 0;
     return Qnil;
 }
+/* fadein (原版 0x10007ef0): 每帧 C-(i+1)*C/dur (0x10007f40), 尾声置 0 (0x10007f8f)。 */
 static VALUE gfx_fadein(VALUE m, VALUE vframes)
 {
-    (void)m; (void)vframes;
-    rgss_f12_check();       /* 原版 0x10007f65 */
-    gfx_window_close_check();   /* 原版 0x10007f79 */
+    (void)m;
+    int d = NUM2INT(vframes);
+    int C = g_fade_level;
+    if (d >= 1) {
+        for (int i = 0; i < d; i++) {
+            g_fade_level = C - ((i + 1) * C) / d;
+            gfx_step_frame();
+        }
+    }
+    g_fade_level = 0;
+    g_brightness = 255;
     return Qnil;
 }
+/* snap_to_bitmap (原版 0x100083a0): 取 [0x244] 屏幕矩形 (+0x8..+0x14) 尺寸,
+ * 新建 Bitmap 并拷贝当前帧。 */
 static VALUE gfx_snap_to_bitmap(VALUE m)
 {
     (void)m;
-    VALUE args[2] = { INT2FIX(g_screen_w), INT2FIX(g_screen_h) };
+    int w = rgss_render_width(), h = rgss_render_height();
+    uint32_t *bits = (uint32_t *)rgss_render_get_bits();
+    VALUE args[2] = { INT2FIX(w), INT2FIX(h) };
     VALUE bmp = rb_class_new_instance(2, args, rgss_bitmap_class());
+    if (bits && w > 0 && h > 0)
+        rgss_bitmap_copy_bits(bmp, bits, w, h);
     return bmp;
 }
 static VALUE gfx_resize_screen(VALUE m, VALUE vw, VALUE vh)
@@ -213,7 +356,21 @@ static int f_open_log(const char *path, const char *fmt, ...)
 
 void rgss_compose_scene(void);
 
-static VALUE gfx_reset(VALUE m) { (void)m; g_frame_count = 0; g_frozen = 0; return Qnil; }
+/* _reset (原版 0x10007ab0): frame_rate=60 (0x3c), 黑幕清零, vtable+4(0)
+ * 退出转场, 0x10096ad0(+0x254,0,0) 释放快照。 */
+static VALUE gfx_reset(VALUE m)
+{
+    (void)m;
+    g_frame_count = 0;
+    g_frame_rate = 60;
+    g_fade_level = 0;
+    g_brightness = 255;
+    g_transition_mode = 0;
+    g_frozen_active = 0;
+    free(g_freeze_bits); g_freeze_bits = NULL;
+    g_freeze_w = g_freeze_h = 0;
+    return Qnil;
+}
 
 int rgss_current_frame_rate(void) { return g_frame_rate; }
 
@@ -241,7 +398,10 @@ enum {
     RGSS_KEY_NUM = 30
 };
 
-/* 键号 → 主 VK 码 (辅键在 rgss_poll_key 里另行判断) */
+/* 键号 → 主 VK 码 (2026-10-28 按 ctor 0x138a0 槽表修正, B10):
+ *   A(11)=VK_SHIFT(槽表[+0x26]=0x0b), C(13)='Z'([+0x27]=0x0d),
+ *   物理 'C'/'V' 键槽表值为 0 = 原版显式废弃, 不映射。
+ * 辅键在 rgss_poll_key 里另行判断 */
 static const int g_key_vk[RGSS_KEY_NUM] = {
     /*  0 */ 0,
     /*  1 */ 0,
@@ -254,9 +414,9 @@ static const int g_key_vk[RGSS_KEY_NUM] = {
     /*  8 UP    */ VK_UP,
     /*  9 */ 0,
     /* 10 */ 0,
-    /* 11 A */ 'Z',
+    /* 11 A */ VK_SHIFT,        /* B10: 原版 Shift→A, 非 'Z' */
     /* 12 B */ 'X',
-    /* 13 C */ 'C',
+    /* 13 C */ 'Z',             /* B10: 原版 'Z'→C, 非 'C' */
     /* 14 X */ 'A',
     /* 15 Y */ 'S',
     /* 16 Z */ 'D',
@@ -280,6 +440,7 @@ static unsigned char g_key_prev[RGSS_KEY_NUM];
 static int g_rep_key = -1;
 static int g_rep_count = 0;
 static int g_dir4 = 0, g_dir8 = 0;
+static int g_hyst = 0;          /* 原版 CInput+0x9c: 轴迟滞 (0=纵向优先/1=横向优先) */
 
 /* 单键采样: 原版对每个键号检查若干物理键, 任一按下即置位 */
 static int rgss_poll_key(int key)
@@ -295,13 +456,19 @@ static int rgss_poll_key(int key)
     case RGSS_KEY_LEFT:  return (GetAsyncKeyState(VK_NUMPAD4) & 0x8000) != 0;
     case RGSS_KEY_RIGHT: return (GetAsyncKeyState(VK_NUMPAD6) & 0x8000) != 0;
     case RGSS_KEY_UP:    return (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) != 0;
-    /* C 键: 额外接受 Enter/Space (原版 0x0d/0x20) */
+    /* C 键: 额外接受 Enter/Space, 且须 !Alt (B11; 原版 0x10013a9f/10013ab9:
+     * Space/Enter 采样后各验一次 GetAsyncKeyState(VK_MENU) 未按下,
+     * 避免 Alt+Space/Enter 触发系统菜单) */
     case RGSS_KEY_C:
-        return (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0 ||
-               (GetAsyncKeyState(VK_SPACE)  & 0x8000) != 0;
-    /* B 键: 额外接受 Esc (原版 0x1b) */
+        if ((GetAsyncKeyState(VK_RETURN) & 0x8000) ||
+            (GetAsyncKeyState(VK_SPACE)  & 0x8000))
+            return (GetAsyncKeyState(VK_MENU) & 0x8000) == 0;
+        return 0;
+    /* B 键: 额外接受 Esc/Numpad0/Insert (B11; 原版 ctor [+0x25]=0x0c 三键同槽) */
     case RGSS_KEY_B:
-        return (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        return (GetAsyncKeyState(VK_ESCAPE)  & 0x8000) != 0 ||
+               (GetAsyncKeyState(VK_NUMPAD0) & 0x8000) != 0 ||
+               (GetAsyncKeyState(VK_INSERT)  & 0x8000) != 0;
     /* L/R: 额外接受 PageUp/PageDown (原版 0x21/0x22) */
     case RGSS_KEY_L: return (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
     case RGSS_KEY_R: return (GetAsyncKeyState(VK_NEXT)  & 0x8000) != 0;
@@ -328,44 +495,62 @@ static VALUE input_update(VALUE m)
     for (i = 1; i < RGSS_KEY_NUM; i++)
         g_key_now[i] = (unsigned char)rgss_poll_key(i);
 
-    /* 连发: 有新的按下键就切换, 否则给当前键累加计数 (原版 0x13c85 段) */
+    /* 连发 (B14; 原版 0x10013c90-0x10013cb6): 升序扫全部键号, 遇新键
+     * **不 break** — 后者覆盖前者 (最后新键胜出); 扫描后: 连发键仍按住
+     * 则计数 +1, 已松开则清零 (0x10013cb8-0x10013ce5) */
     {
-        int fresh = -1;
         for (i = 1; i < RGSS_KEY_NUM; i++) {
-            if (g_key_now[i] && !g_key_prev[i]) { fresh = i; break; }
+            if (g_key_now[i] && !g_key_prev[i]) {
+                g_rep_key = i;
+                g_rep_count = 0;    /* 原版置 0, 扫描后的持有检查再 +1 */
+            }
         }
-        if (fresh >= 0) {
-            g_rep_key = fresh;
-            g_rep_count = 1;
-        } else if (g_rep_key >= 0 && g_key_now[g_rep_key]) {
+        if (g_rep_key >= 1 && g_key_now[g_rep_key]) {
             g_rep_count++;
         } else {
-            g_rep_key = -1;
+            g_rep_key = 0;
             g_rep_count = 0;
         }
     }
 
-    /* dir4 / dir8 — 原版 0x13cee 起: 先算竖直/水平分量再合成 */
+    /* dir8 / dir4 (B12+B13; 原版 0x10013cee-0x10013d9f 逐指令还原):
+     *   h = right-left, v = up-down
+     *   dir8: h<0→(v<0?7:v==0?4:1)  h==0→(v<0?8:v>0?2:0)  h>0→(v<0?9:v==0?6:3)
+     *   轴迟滞 (+0x9c): 纯纵向 (h==0&&v!=0) → hyst=0; 纯横向 (h!=0&&v==0) → hyst=1;
+     *   斜向时 hyst==0 抑制纵向 (v=0), hyst==1 抑制横向 (h=0)
+     *   → 效果: 从直线移动进入斜向时, 沿原轴继续 (新轴不生效), 与原版一致
+     *   dir4 (+0x94): 左→上→右→下 顺序**覆盖写**, 末写胜 (down>right>up>left)
+     */
     {
         int up    = g_key_now[RGSS_KEY_UP]    ? 1 : 0;
         int down  = g_key_now[RGSS_KEY_DOWN]  ? 1 : 0;
         int left  = g_key_now[RGSS_KEY_LEFT]  ? 1 : 0;
         int right = g_key_now[RGSS_KEY_RIGHT] ? 1 : 0;
-        int v = up - down;
+        int v = down - up;   /* 原版 edx: DOWN=+1 / UP=-1 (0x13cf6 or / 0x13d0a add) */
         int h = right - left;
 
-        g_dir8 = 0;
-        if (v > 0)      g_dir8 = (h > 0) ? 9 : (h < 0) ? 7 : 8;
-        else if (v < 0) g_dir8 = (h > 0) ? 3 : (h < 0) ? 1 : 2;
-        else if (h > 0) g_dir8 = 6;
-        else if (h < 0) g_dir8 = 4;
+        /* dir8 用原始 h/v (0x13d0c-0x13dcc), 不受迟滞影响 */
+        if (h < 0)      g_dir8 = (v < 0) ? 7 : (v == 0) ? 4 : 1;
+        else if (h == 0) {
+            g_dir8 = (v < 0) ? 8 : (v > 0) ? 2 : 0;
+            if (v != 0) g_hyst = 0;         /* 原版 0x10013d5f */
+        } else /* h > 0 */ {
+            g_dir8 = (v < 0) ? 9 : (v == 0) ? 6 : 3;
+        }
 
-        /* dir4 优先竖直分量 (原版 0x13d65 段) */
+        /* 轴迟滞 (0x13dcf-0x13de6): 只作用于 dir4 的输入 */
+        if (h != 0) {
+            if (v == 0) g_hyst = 1;         /* 原版 0x10013deb */
+            else if (g_hyst == 0) v = 0;    /* 原版 0x10013ddd: 纵向抑制 */
+            else if (g_hyst == 1) h = 0;    /* 原版 0x10013de4: 横向抑制 */
+        }
+
+        /* dir4 末写覆盖 (原版 0x10013d65-0x10013d9f) */
         g_dir4 = 0;
-        if (v > 0)      g_dir4 = 8;
-        else if (v < 0) g_dir4 = 2;
-        else if (h > 0) g_dir4 = 6;
-        else if (h < 0) g_dir4 = 4;
+        if (h < 0) g_dir4 = 4;
+        if (v < 0) g_dir4 = 8;
+        if (h > 0) g_dir4 = 6;
+        if (v > 0) g_dir4 = 2;
     }
 
     /* 诊断: 有按键时写一行日志, 便于外部验证采样是否生效 */
@@ -637,6 +822,7 @@ typedef struct {
     VALUE viewport, bitmap, color, tone;
     double x, y, z, ox, oy, zoom_x, zoom_y;
     int visible, opacity, blend_type;
+    int disposed;
 } PlaneVal;
 static void plane_free(void *p) { free(p); }
 static void plane_mark(void *p)
@@ -683,8 +869,8 @@ static VALUE plane_color(VALUE s) { return GET_PLANE(s)->color; }
 static VALUE plane_color_set(VALUE s, VALUE v) { GET_PLANE(s)->color = v; return v; }
 static VALUE plane_tone(VALUE s) { return GET_PLANE(s)->tone; }
 static VALUE plane_tone_set(VALUE s, VALUE v) { GET_PLANE(s)->tone = v; return v; }
-static VALUE plane_dispose(VALUE s) { (void)s; return Qnil; }
-static VALUE plane_disposed_p(VALUE s) { (void)s; return Qfalse; }
+static VALUE plane_dispose(VALUE s) { GET_PLANE(s)->disposed = 1; GET_PLANE(s)->visible = 0; return Qnil; }
+static VALUE plane_disposed_p(VALUE s) { return GET_PLANE(s)->disposed ? Qtrue : Qfalse; }
 static VALUE plane_update(VALUE s) { (void)s; return Qnil; }
 
 /* ================= Tilemap ================= */
@@ -692,6 +878,7 @@ typedef struct {
     VALUE viewport, map_data, flash_data, passages, bitmaps;
     double x, y, z, ox, oy;
     int visible, opacity, blend_type;
+    int disposed;
 } TilemapVal;
 static void tilemap_free(void *p) { free(p); }
 static void tilemap_mark(void *p)
@@ -730,8 +917,14 @@ static VALUE tilemap_visible(VALUE s) { return GET_TILEMAP(s)->visible ? Qtrue :
 static VALUE tilemap_visible_set(VALUE s, VALUE v) { GET_TILEMAP(s)->visible = RTEST(v); return v; }
 static VALUE tilemap_viewport(VALUE s) { return GET_TILEMAP(s)->viewport; }
 static VALUE tilemap_viewport_set(VALUE s, VALUE v) { GET_TILEMAP(s)->viewport = v; return v; }
-static VALUE tilemap_dispose(VALUE s) { (void)s; return Qnil; }
-static VALUE tilemap_disposed_p(VALUE s) { (void)s; return Qfalse; }
+static VALUE tilemap_dispose(VALUE s)
+{
+    TilemapVal *t = GET_TILEMAP(s);
+    t->disposed = 1; t->visible = 0;
+    tilemap_unregister(t);
+    return Qnil;
+}
+static VALUE tilemap_disposed_p(VALUE s) { return GET_TILEMAP(s)->disposed ? Qtrue : Qfalse; }
 static VALUE tilemap_update(VALUE s) { (void)s; return Qnil; }
 
 /* bitmaps: 9 张图块素材 (TileA1..A5, TileB..E), 脚本按索引写入。
@@ -761,6 +954,7 @@ typedef struct {
     VALUE viewport, windowskin, contents, cursor_rect;
     double x, y, z, ox, oy, zoom_x, zoom_y, openness, back_opacity, contents_opacity;
     int visible, pause, active;
+    int disposed;
     int width, height, opacity;
 } WindowVal;
 static void tilemap_register(void *tp)
@@ -907,8 +1101,17 @@ static VALUE window_windowskin(VALUE s) { return GET_WIN(s)->windowskin; }
 static VALUE window_windowskin_set(VALUE s, VALUE v) { GET_WIN(s)->windowskin = v; return v; }
 static VALUE window_cursor_rect(VALUE s) { return GET_WIN(s)->cursor_rect; }
 static VALUE window_cursor_rect_set(VALUE s, VALUE v) { GET_WIN(s)->cursor_rect = v; return v; }
-static VALUE window_dispose(VALUE s) { (void)s; return Qnil; }
-static VALUE window_disposed_p(VALUE s) { (void)s; return Qfalse; }
+/* dispose 后窗口脱离绘制列表 (对齐 Sprite.dispose 语义;
+ * Scene_Menu#terminate 等场景销毁路径依赖它移除 @status_window) */
+static VALUE window_dispose(VALUE s)
+{
+    WindowVal *w = GET_WIN(s);
+    w->disposed = 1;
+    w->visible = 0;
+    win_unregister(w);
+    return Qnil;
+}
+static VALUE window_disposed_p(VALUE s) { return GET_WIN(s)->disposed ? Qtrue : Qfalse; }
 static VALUE window_update(VALUE s) { (void)s; return Qnil; }
 
 /* ================= 注册 ================= */
@@ -1542,7 +1745,7 @@ void rgss_compose_scene(void)
     /* 地图层先画 (位于精灵之下) */
     for (int ti = 0; ti < g_tilemap_count; ti++) {
         TilemapVal *tm = (TilemapVal *)g_tilemaps[ti];
-        if (!tm || !tm->visible) continue;
+        if (!tm || tm->disposed || !tm->visible) continue;
         int tox = (int)tm->ox, toy = (int)tm->oy;
         for (int layer = 0; layer < 2; layer++)
             draw_tilemap_layer(tm, tm->map_data, layer, tox, toy);
@@ -1600,7 +1803,7 @@ void rgss_compose_scene(void)
     }
     for (int i = 0; i < g_window_count; i++) {
         WindowVal *w = g_windows[i];
-        if (!w || !w->visible) continue;
+        if (!w || w->disposed || !w->visible) continue;
         if (w->width <= 0 || w->height <= 0) continue;
         int wx = (int)w->x, wy = (int)w->y;
         int ww = w->width, wh = w->height;
