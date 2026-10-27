@@ -1,4 +1,6 @@
-# RESTRUCTURE_PLAN — SCOPE 仓库结构重构工单
+# ADR-0001 — SCOPE 仓库结构重构（决策与执行记录）
+
+> **已完成（2026-10-28）**：四刀全部执行，G1–G7 验证全过。执行偏差见文末附录。
 
 > 状态：**待执行**。执行完在文首标注"已完成（日期）"，然后整体归档到 `docs/adr/0001-repository-restructure.md`。
 > 产出方式：2026-10-27 与主人逐轮问答敲定（Q1–Q31，决策记录见 §A）。
@@ -368,3 +370,25 @@ desktop.ini
 | 29 | rm2k 暂不分 2000/2003（C），决定入 ADR |
 | 30 | 先落本工单（C），主人提交其他会话执行 |
 | 31 | 本文件放根目录，执行完归档 `docs/adr/0001`（A） |
+
+---
+
+## 附录：执行记录（2026-10-28，与工单的偏差）
+
+| 偏差 | 说明 |
+|------|------|
+| 禁删令 | 主人在执行中下达"一切不删，待删物移 E:/rgss-trash"。工单中所有"删除"步骤改为移入垃圾箱或保留原状列入待清清单 |
+| docs_rgss1_rtti_tmp.txt | 在禁删令到达前已被删除（无跟踪文件，不可恢复；内容按原 .gitignore 注释早已并入 docs/reports/rgss1/） |
+| embedded_rpg_classes.pretty.rb | 未删，仍在库中（与 .rb 内容差 999 个换行，已验证）；列入待清清单 |
+| tools 产物 | 全部移入 E:/rgss-trash（24 项），新版经 tools/Makefile 重建验证 |
+| 锁定目录 | 执行中发现遗留 Game.exe（PID 53176）占用 Project3_rebuild，已结束；backup/unpacked/build/third_party/test 因目录句柄逐文件搬迁，空壳目录已移除 |
+| 脚注事故 | 首次 sed 插脚注拆坏了 34 份文档的 H1，两轮 perl 修复并抽查无损 |
+| 交付要求.md | 归入 docs/reports/rgss2/（工单默认值，主人未推翻） |
+| tsv 文件名 | 保留原名 rgss_ruby_api_map.tsv（工单树中 api_map.tsv 为简写） |
+| 补充文档 | docs/analysis/rgss2/window_skin_9slice.md（PROGRESS §八独有内容，防丢失）；docs/adr/0002-runtime-granularity.md（Q15r/Q29 判据） |
+| A1 遗产 | 会话开始前工作区已有 A1 修订 + A2/A4/差异清单/白盒总报告四个未跟踪文件，先于重构以独立 commit 入库（75eeab1） |
+
+验证结果：G2 DLL 69 导出 ✅ / G3 smoke ✅ / G4 电池 10/10 ✅ / G5 tools 17exe+2dll ✅ /
+G6 结构性引用清零 ✅ / G7 真实游戏标题画面 ✅（截图 local/build/g7_title.png）
+
+Commits: 1506bf7（刀1）→ 34081ac+aebba5d（刀2）→ 4700ee8（刀3）→ f7fb7c3（刀4）→ 本归档
