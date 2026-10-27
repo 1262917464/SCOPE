@@ -1,5 +1,5 @@
 /*
- * rgss_bitmap.c — Bitmap 类实现（重建版）
+ * bitmap.c — Bitmap 类实现（重建版）
  *
  * 布局规格来源: docs/M5-c_Bitmap布局与像素格式.md（get_pixel/set_pixel 汇编解码）
  *   RData 对象:
@@ -1126,13 +1126,13 @@ void rgss_init_bitmap(VALUE super)
     rb_define_method(cBitmap, "radial_blur", bm_radial_blur, 2);
 }
 
-/* 供 rgss_classes.c 使用 */
+/* 供 classes.c 使用 */
 VALUE rgss_bitmap_class(void) { return cBitmap; }
 void rgss_set_color_class(VALUE c) { cColor = c; }
 void rgss_set_rect_class(VALUE r) { cRect = r; }
 
 /* ================= GDI+ 图片加载（C 接口） ================= */
-/* gdiplus 的 C 接口在 C 模式下不可用, 改用 C++ 单元实现 (rgss_image.cpp) */
+/* gdiplus 的 C 接口在 C 模式下不可用, 改用 C++ 单元实现 (image.cpp) */
 extern int rgss_load_image(const char *path, unsigned int **out_bits, int *out_w, int *out_h);
 
 static int load_image_gdiplus(const char *path, uint32_t **out_bits, int *out_w, int *out_h)

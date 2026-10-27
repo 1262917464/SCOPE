@@ -1,5 +1,5 @@
 /*
- * rgss_image.cpp — GDI+ 图片加载（C++ 单元，供 rgss_bitmap.c 调用）
+ * image.cpp — GDI+ 图片加载（C++ 单元，供 bitmap.c 调用）
  */
 #include <windows.h>
 #include <objidl.h>

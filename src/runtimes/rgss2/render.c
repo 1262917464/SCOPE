@@ -1,5 +1,5 @@
 /*
- * rgss_render.c — Graphics 渲染管线（GDI + DIB 后缓冲 + Sprite 合成）
+ * render.c — Graphics 渲染管线（GDI + DIB 后缓冲 + Sprite 合成）
  *
  * 架构（对应原版 Nx 层）:
  *   后缓冲 DIB (ARGB8888, 544x416) ← Sprite/Plane/Tilemap/Window 绘制
@@ -16,7 +16,7 @@
 extern VALUE rgss_bitmap_class(void);
 extern VALUE rgss_rect_class(void);
 
-/* 后缓冲（由 rgss_graphics_classes.c 的 Graphics 模块共享） */
+/* 后缓冲（由 graphics_classes.c 的 Graphics 模块共享） */
 typedef struct {
     HWND      hwnd;
     int       width, height;
@@ -160,7 +160,7 @@ void rgss_render_blit(const SrcSurface *src,
     }
 }
 
-/* ---------- Ruby 侧: Graphics 内部（由 rgss_graphics_classes.c 调用） ---------- */
+/* ---------- Ruby 侧: Graphics 内部（由 graphics_classes.c 调用） ---------- */
 void *rgss_render_get_bits(void) { return g_rc.bits; }
 int rgss_render_width(void) { return g_rc.width; }
 int rgss_render_height(void) { return g_rc.height; }

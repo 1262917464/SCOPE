@@ -1,5 +1,5 @@
 /*
- * rgss_classes.c — RGSS 类注册（两阶段链，结构照抄原版）
+ * classes.c — RGSS 类注册（两阶段链，结构照抄原版）
  *
  * 阶段 A (RGSSInitialize2 → sub_10009E60): Audio / Table / Color / Tone / Rect
  * 阶段 B (CGameFrame::Run → sub_10009F40):  RGSSError + Graphics/Bitmap/Viewport/

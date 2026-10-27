@@ -1,5 +1,5 @@
 /*
- * rgss_export.c — RGSS202E.dll 重建版: 69 个导出桩
+ * export.c — RGSS202E.dll 重建版: 69 个导出桩
  * 目标: drop-in 替换, 导出表与原版 1:1
  * 阶段: 骨架 (M5-e) — 结构就位, 逐步填充实现
  */
@@ -27,7 +27,7 @@ static VALUE eval_protect(const char *code, int *state)
 }
 
 /* ---------- 1. 生命周期 ---------- */
-/* 由 rgss_classes.c / rgss_gamemain.c 提供 */
+/* 由 classes.c / gamemain.c 提供 */
 void rgss_register_phase_a(void);
 int  __cdecl rgss_game_main(int a, int b, int c);
 

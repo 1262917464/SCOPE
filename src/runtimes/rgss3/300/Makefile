@@ -5,15 +5,15 @@
 #   make clean
 #
 # 依赖：C:\msys64\mingw32 的 i686-w64-mingw32-gcc +
-#       build/rubylib/libruby192-static.a（Ruby 1.9.2p0 静态库）
+#       $(SCOPE_LOCAL)/build/rubylib/libruby192-static.a（Ruby 1.9.2p0 静态库）
+# 注意：rgss3 用 Ruby 1.9.2（rubylib），与 rgss2 的 Ruby 1.8.1（ruby-build）是两个不同目录
 
-MINGW   ?= /c/msys64/mingw32/bin
-CC      := $(MINGW)/i686-w64-mingw32-gcc
-WINDRES := $(MINGW)/i686-w64-mingw32-windres
+REPO    := $(abspath ../../../..)
+SCOPE_LOCAL ?= $(REPO)/local
+include ../../../mk/common.mk
 
-ROOT    := ../..
-RUBYLIB := $(ROOT)/build/rubylib
-OUTDIR  := $(ROOT)/build/RGSS3_300
+RUBYLIB := $(SCOPE_LOCAL)/build/rubylib
+OUTDIR  := $(SCOPE_LOCAL)/build/RGSS3_300
 TARGET  := $(OUTDIR)/RGSS300.dll
 
 SRCS    := rgss_core.c

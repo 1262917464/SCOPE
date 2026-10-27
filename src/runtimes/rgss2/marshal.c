@@ -1,5 +1,5 @@
 /*
- * rgss_marshal.c — load_data / save_data（Ruby 1.8 Marshal 封装）
+ * marshal.c — load_data / save_data（Ruby 1.8 Marshal 封装）
  * 原版: rb_define_global_function("load_data", sub_10009A90, 1)
  *       rb_define_global_function("save_data", sub_10008D90, 2)
  *

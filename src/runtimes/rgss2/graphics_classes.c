@@ -1,5 +1,5 @@
 /*
- * rgss_graphics_classes.c — Graphics / Sprite / Viewport / Plane / Tilemap /
+ * graphics_classes.c — Graphics / Sprite / Viewport / Plane / Tilemap /
  *                           Window / Input / Audio 实现（重建版）
  * 依据: docs/M5-c_图形类注册链.md + docs/M5-c_Bitmap布局与像素格式.md
  *       328 条 API 映射表 (docs/assets/rgss_ruby_api_map.tsv)
@@ -37,7 +37,7 @@ static int   g_frozen = 0;
 static int   g_screen_w = 544, g_screen_h = 416;
 static HWND  g_hwnd;
 
-/* 渲染管线（rgss_render.c） */
+/* 渲染管线（render.c） */
 int  rgss_render_init(HWND hwnd, int w, int h);
 void rgss_render_shutdown(void);
 void rgss_render_present(void);
@@ -1213,7 +1213,7 @@ static int bitmap_surface(VALUE vbmp, SrcSurface *out)
     int w = NUM2INT(vw), h = NUM2INT(vh);
     if (w <= 0 || h <= 0) return 0;
     out->w = w; out->h = h; out->stride = w;
-    /* Bitmap 结构首字段即 pixels（见 rgss_bitmap.c） */
+    /* Bitmap 结构首字段即 pixels（见 bitmap.c） */
     out->bits = *(uint32_t **)DATA_PTR(vbmp);
     return out->bits != NULL;
 }

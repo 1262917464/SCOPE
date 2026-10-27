@@ -1,5 +1,5 @@
 /*
- * rgss_gamemain.c — RGSSGameMain 主循环实现（重建版）
+ * gamemain.c — RGSSGameMain 主循环实现（重建版）
  *
  * 依据 docs/M5_主循环与Init归属.md（sub_1000AFD0 全解）:
  *   - F12 = Reset 异常触发重启（外层 while(true)）

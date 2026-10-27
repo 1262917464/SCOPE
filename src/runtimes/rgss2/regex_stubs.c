@@ -1,5 +1,5 @@
 /*
- * rgss_regex_stubs.c — 正则/编码 36 个导出的实现骨架
+ * regex_stubs.c — 正则/编码 36 个导出的实现骨架
  *
  * 说明（M5-e 事实核对结果）:
  *   - 官方 GNU regex 符号 (ruby_re_*) : 由 Ruby 静态库提供, 需在 .def 里作为真实导出

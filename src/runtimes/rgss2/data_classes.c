@@ -1,5 +1,5 @@
 /*
- * rgss_data_classes.c — Color / Tone / Rect / Table / Font 实现
+ * data_classes.c — Color / Tone / Rect / Table / Font 实现
  * 行为依据: M5-c 运行时反射实测
  *   Color: 浮点存储, alpha 默认 255; 方法 == === _dump alpha alpha= blue blue= eql?
  *          green green= red red= set to_s + 单例 _load
