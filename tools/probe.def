@@ -1,0 +1,4 @@
+LIBRARY rgssprobe
+EXPORTS
+  probe_a
+  probe_b

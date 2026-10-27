@@ -1,0 +1,6 @@
+LIBRARY RGSS1_probe
+EXPORTS
+    probe_a
+    probe_b
+    probe_c
+    probe_d

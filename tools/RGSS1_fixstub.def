@@ -1,0 +1,6 @@
+LIBRARY RGSS1_probe
+EXPORTS
+    fix_visible
+    fix_tick3
+    fix_tick5
+    fix_unknown

@@ -1,0 +1,25 @@
+# 统一换行：仓库内存 LF，检出时按平台（Windows -> CRLF）。
+# 本机 core.autocrlf=true，这里显式声明以免不同机器上产生假 diff。
+* text=auto
+
+# 源码与文档
+*.c      text
+*.h      text
+*.cpp    text
+*.def    text
+*.py     text
+*.rb     text
+*.ps1    text
+*.S      text
+*.md     text
+*.tsv    text
+Makefile text
+
+# 二进制：不做任何转换
+*.png    binary
+*.bmp    binary
+*.exe    binary
+*.dll    binary
+*.gz     binary
+*.o      binary
+*.lib    binary
