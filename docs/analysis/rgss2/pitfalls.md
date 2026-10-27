@@ -54,6 +54,8 @@
 | 43 | **font_resolve_face 用 GetTextFaceW 回读匹配 (臆造)** | 判定语义与原版完全不同, 误接受/误拒绝字体名 | 原版真实逻辑: 0x13450 用 EnumFontFamiliesExW 建**系统字体族名集合**(存 RGSS+0x260), setter 用 0x12FE0 查集合, 命中才 add_name (0x12860, 上限 10 个); 0x129A0 按索引逐个 CreateFontIndirectW, 失败才 +1 重试 |
 | 44 | **误把 0x8F060/0x8EF40 当字体名过滤器** | 注释与实现都建立在错误前提上 | 0x8EF40 实为**防盗版联网校验** (winsock 错误码 0x2736/0x276D), 与字体无关; 已在 M5-k 更正 |
 | 45 | **★字体族集合容器只有 40 槽, 枚举出 5570 个族 → 截断★** | **字体实际回退成宋体 (req≠actual), 字形完全不对** | 容器扩到 16384。截断导致查不到的名字被判"可用" (fail-open), 直接交给 GDI 后静默回退宋体。修正后 req=actual=霞鹜文楷屏幕阅读版R, cellX=17 与原版字距一致 |
+| 46 | **★文字混合用 a/255 权重的 REPLACE/over, 而非原版 F[a]=a+1 查表式★** | **阴影明显偏淡** (暗环带 B 通道 121.8 vs 原版 93.0, 最暗点 53.7 vs 32.6) | 照原版混合器精确还原 (见 M5-k §八): `out_c = dst_c + (src_c−dst_c)×F[a]>>8` 四通道, F[0]=0/F[a]=a+1 (0x100A9790 初始化), 字体 alpha 走 src 的 alpha 通道。修正后暗环带 96.1 vs 93.0, 最暗点 35.1 vs 32.6 (残差来自窗口背景 +9B 偏差), 近白像素比 0.997 |
+| 47 | **★contents→屏幕合成用直通 alpha, 源色未按字体 alpha 预乘★** | **文字边缘偏瘦** (f² 双重乘, 字芯 131 vs 175); 禁用项饱和 255 vs 155 | 原版管线: 混合器对透明 dst 产出预乘值 (rgb=src×f, a=f), 源色 tile 由同一混合器生成 (rgb 已按 fa 预乘), contents→屏幕为预乘 over (screen=rgb+dst×(1−a))。实现: write_over 源色预乘 + render_blit 内部 mode 3 (预乘 over, 仅 contents 合成)。**mode 3 必须钳制** (预乘 rgb + bg 残余 >255, 溢出致禁用项变黄) |
 
 ## Ruby 1.8.1 C API 陷阱（写代码必看）
 
@@ -65,3 +67,21 @@
 5. `rb_mMarshal` 不存在 → `rb_const_get(rb_cObject, rb_intern("Marshal"))`。
 6. `Marshal.load` 接受**字符串数据或 IO**，不是文件名。
 7. `RGSSGetStringUTF8` 用静态缓冲，连续调用互相覆盖（原版同样行为）。
+
+## 逆向定性判据（遇"用途不明函数"必看）
+
+> 来源：0x1008EF40 两次误判事故（M5-i 误判为"字体可用性过滤"→ M5-k 误判为"防盗版联网校验"
+> → 2026-10-28 主人质疑后对质 Ruby 源码，实为 `win32.c is_socket()`）。三条判据，按序使用：
+
+1. **Ruby 源码优先**：原版静态链接了完整 Ruby 1.8.1，DLL 里大量"怪函数"就是 Ruby
+   自身（win32.c/socket.c/regex.c/…）。任何含 winsock 错误码、TLS、临界区、stdio
+   模式、fd_set（count + 64 元素数组 = FD_SETSIZE）特征的函数，先拿
+   `local/third_party/ruby-1.8.1/` 官方源码 grep 对质（搜常量比搜函数名快：
+   如 `WSAENOTSOCK`/`0x1008`+`0xffff` 参数对），定性后才允许写进文档。
+2. **常见常量指纹速查**：`0xffff`+`0x1008` = getsockopt(SOL_SOCKET, SO_TYPE)；
+   `0x2736/0x276d` = WSAENOTSOCK/WSANOTINITIALISED；`0x94` = OSVERSIONINFOW 尺寸；
+   `0x40` 上限循环 = FD_SETSIZE 或 64 字节族名槽。见到即查 Ruby，别发明语义。
+3. **二手结论入档前必须复核**：审计线引用开发线文档里的定性（或反之）时，
+   要么自己验证到证据级，要么在清单里标注"转引自 X，未验证"。
+   反例：差异清单 B48 曾基于 M5-k §4.2 登记"防盗版校验"，实际不存在（见
+   `docs/analysis/rgss2/差异清单.md` §三-A）。

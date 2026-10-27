@@ -1,27 +1,56 @@
 /*
  * gamemain.c — RGSSGameMain 主循环实现（重建版）
  *
- * 依据 docs/M5_主循环与Init归属.md（sub_1000AFD0 全解）:
- *   - F12 = Reset 异常触发重启（外层 while(true)）
- *   - Game.ini 读 Scripts 路径 → $RGSS_SCRIPTS = load_data + Zlib::Inflate
- *   - 逐段 eval("'Section%03d'") + eval(src)
- *   - 正常退出: Graphics._reset;Input.update;Audio.*_stop;GC.start
+ * 对齐原版 0x10002890 (RGSSGameMain) + sub_1000AFD0 (主循环) + 0x100014a0 (F12 检查):
+ *   - 入口: 读 $TEST 全局 → 旗标(原版 0x1016EFE0, eax==2 即 Qtrue)
+ *   - 主循环外: eval("Graphics._reset")(0x1000b0e9, 字符串 0x101047a0)
+ *   - 大循环 while(1):
+ *       F12 按住 → 泵消息+限帧的迷你帧循环, 窗口关闭则退出 (0x1000b10b)
+ *       读 Game.ini → eval load_data('$RGSS_SCRIPTS') + Zlib::Inflate (每轮重读)
+ *       逐段: eval("'Section%03d'") → eval("$RGSS_SCRIPTS[i][3]") →
+ *             运行标志(0x10173478)=1 → eval(src) → =0
+ *       异常 → $!.type.to_s == "Reset" ? 清理链+重启 : 错误弹窗+退出
+ *       正常完成 → 清理链 + eval("Graphics._reset;Input.update;Audio...;GC.start") → 退出
+ *   - F12 的每帧检查在 graphics_classes.c (原版 0x100014a0, raise 类名 "Reset")
+ *   - 每轮清理: ×6 注册表清扫 (rgss_engine_reset_registries) + eval 清理串
+ *   - F12 按住: 迷你帧循环 = 泵消息 + 继续合成渲染 + 限帧 (0x10001640/0x10001890)
+ *
+ * 已知保留差异 (差异清单):
+ *   - SetUnhandledExceptionFilter 崩溃日志 (调试辅助, 原版无)
+ *   - 清扫后孤儿 Ruby 对象的 disposed? 语义 (原版置引擎侧 disposed, 重建由 GC 释放)
+ *   - Game.rgssad 归档读取未实现 (差异清单 S19), 仅支持散装 Data/
  */
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
 #include "ruby.h"
+#include "debug.h"
 
 void rgss_register_phase_a(void);
 void rgss_register_phase_b(void);
 void rgss_graphics_set_hwnd(HWND h, int w, int hh);
+void rgss_engine_reset_registries(void);   /* graphics_classes.c: ×6 清扫等价 */
+void rgss_render_clear(unsigned int argb); /* render.c */
+void rgss_compose_scene(void);
+void rgss_render_present(void);
+int  rgss_current_frame_rate(void);
 
-static HWND  g_hwnd;
-extern HWND  rgss_get_host_hwnd(void);
-static int   g_running;
-static int   g_reset_requested;
-static char  g_scripts_fname[260];
+static HWND g_hwnd;
+static int  g_test_flag;        /* 原版 0x1016EFE0: RGSSGameMain 读 $TEST */
+static int  g_scripts_loading;  /* 原版 0x1015B0C0: 脚本装载中 */
+static int  g_script_running;   /* 原版 0x10173478: 脚本段执行中 */
+
+/* ---------- F12 每帧检查 (原版 0x100014a0) ---------- */
+/* graphics_classes.c 的 Graphics.update/fadeout/fadein/transition 每帧调用。
+ * F12 按下 → raise 类名 "Reset" 的异常, 从 eval 冒出到主循环实现重启。 */
+void rgss_f12_check(void)
+{
+    if ((SHORT)GetAsyncKeyState(VK_F12) < 0) {
+        VALUE cls = rb_define_class("Reset", rb_eException); /* 已定义则返回原类 */
+        rb_raise(cls, "Reset");
+    }
+}
 
 /* ---------- 窗口过程 ---------- */
 static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
@@ -32,9 +61,6 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
-        return 0;
-    case WM_KEYDOWN:
-        if (wp == VK_F12) g_reset_requested = 1;
         return 0;
     }
     return DefWindowProcA(h, msg, wp, lp);
@@ -67,238 +93,281 @@ static HWND create_game_window(const char *title, int w, int h)
     return hwnd;
 }
 
-/* ---------- Game.ini 读取 ---------- */
-static void read_scripts_path(char *out, size_t outsz)
+/* ---------- Game.ini 读取 (原版每轮循环重读, sub_10008C70) ---------- */
+static int read_scripts_path(char *out, size_t outsz)
 {
-    out[0] = 0;
     char ini[MAX_PATH];
+    out[0] = 0;
     GetModuleFileNameA(NULL, ini, MAX_PATH);
     char *p = strrchr(ini, '\\');
-    if (!p) return;
+    if (!p) return 0;
     strcpy(p + 1, "Game.ini");
     GetPrivateProfileStringA("Game", "Scripts", "Data\\Scripts.rvdata",
                              out, (DWORD)outsz, ini);
+    /* 原版前置检查 sub_1000ACC0: 归档或散装文件可读; 重建只支持散装 (S19) */
+    if (!out[0]) return 0;
+    DWORD attr = GetFileAttributesA(out);
+    return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
 }
 
-/* ---------- 脚本装载与执行 ---------- */
-static void logmsg(const char *fmt, ...)
+/* ---------- 每轮清理 (原版 0x1000b3c8-0x1000b3f6) ----------
+ * 原版先做 6 个 C 侧子系统清理 (sub_100048F0/10010EA0/1000E080/1000F970/
+ * 1000BF70/10012100, 归属未定未还原, 见差异清单 B49), 再 eval 清理串。成功与
+ * Reset 两路都经过这里。 */
+static void rgss_cleanup_pass(void)
 {
-    FILE *f = fopen("rgss_rebuild.log", "a");
-    if (!f) return;
-    va_list ap; va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    va_end(ap);
-    fputc(10, f);
-    fclose(f);
+    /* 原版 ×6: 引擎对象注册表 dispose 清扫 (B49 已还原部分) */
+    rgss_engine_reset_registries();
+    int st = 0;
+    rb_eval_string_protect(
+        "Graphics._reset;Input.update;Audio.me_stop;Audio.se_stop;"
+        "Audio.bgm_stop;Audio.bgs_stop;GC.start;", &st);
 }
 
-static int load_and_run_scripts(const char *fname)
+/* ---------- 错误弹窗 (原版 sub_1000A080) ---------- */
+static void show_script_error(void)
+{
+    VALUE err = rb_gv_get("$!");
+    char buf[2048];
+    if (NIL_P(err)) {
+        lstrcpynA(buf, "Unknown error ($! is nil)", (int)sizeof buf);
+    } else {
+        int st = 0;
+        VALUE bt = rb_eval_string_protect(
+            "$!.backtrace ? $!.backtrace[0,8].join(\"\\n\") : ''", &st);
+        VALUE msg = rb_funcall(err, rb_intern("message"), 0);
+        _snprintf(buf, sizeof buf - 1, "%s: %s%s%.700s",
+                  rb_obj_classname(err), StringValueCStr(msg),
+                  (!st && !NIL_P(bt) && RSTRING(bt)->len) ? "\n" : "",
+                  (!st && !NIL_P(bt)) ? StringValueCStr(bt) : "");
+        buf[sizeof buf - 1] = 0;
+    }
+    MessageBoxA(g_hwnd, buf, "RGSS Error", MB_ICONWARNING);
+}
+
+/* ---------- 主循环一次迭代 (原版 sub_1000AFD0 的 while(1) 体) ----------
+ * 返回 0=正常结束, 1=Reset 重启, -1=错误(已弹窗, 退出) */
+static int run_scripts_pass(void)
 {
     char code[4096];
+    char fname[260];
     int state = 0;
-    logmsg("[load] scripts=%s", fname);
 
-    /* 1. 读入并解压 $RGSS_SCRIPTS */
+    /* 原版 0x1000b10b: F12 按住 → 迷你帧循环 (0x10001640 限帧 + 0x10001890
+     * 泵消息+继续渲染), 窗口关闭 → 退出 */
+    while ((SHORT)GetAsyncKeyState(VK_F12) < 0) {
+        MSG msg;
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        if (!g_hwnd || !IsWindow(g_hwnd)) return 0;
+        rgss_render_clear(0xFF000000u);
+        rgss_compose_scene();
+        rgss_render_present();
+        Sleep(1000 / (rgss_current_frame_rate() > 0 ? rgss_current_frame_rate() : 60));
+    }
+
+    /* 原版 sub_10008C70: 每轮重读 Game.ini */
+    if (!read_scripts_path(fname, sizeof fname)) {
+        /* 原版: LoadStringW 资源 id 8 错误模板 → 弹窗 (0x1000b03d-0x1000b0a4) */
+        MessageBoxA(g_hwnd, "Failed to load Scripts.\n(Game.ini [Game] Scripts)",
+                    "RGSS Error", MB_ICONERROR);
+        return -1;
+    }
+
+    /* 读入 $RGSS_SCRIPTS (原版 aRgssScriptsLoa eval 串, 0x1000b18a) */
     snprintf(code, sizeof code,
         "$RGSS_SCRIPTS = load_data('%s');"
         "$RGSS_SCRIPTS.each { |s| s[3,0] = Zlib::Inflate.inflate(s[2]) };"
         "$RGSS_SCRIPTS.size", fname);
-    logmsg("[load] evaluating script loader");
+    g_scripts_loading = 1;                       /* 原版 0x1015B0C0 */
     VALUE n = rb_eval_string_protect(code, &state);
-    logmsg("[load] eval done state=%d", state);
-    if (state) {
+    g_scripts_loading = 0;
+    if (state) goto exception;
+
+    {
+        int count = NUM2INT(n);
+        for (int i = 0; i < count; i++) {
+            state = 0;
+            /* eval("'Section%03d'") — 包装段名, 错误栈显示用 (0x1000b252) */
+            snprintf(code, sizeof code, "'Section%03d'", i);
+            rb_eval_string_protect(code, &state);
+            if (state) goto exception;
+
+            /* eval("$RGSS_SCRIPTS[%d][3]") (0x1000b292) */
+            snprintf(code, sizeof code, "$RGSS_SCRIPTS[%d][3]", i);
+            VALUE src = rb_eval_string_protect(code, &state);
+            if (state) goto exception;
+            if (NIL_P(src) || TYPE(src) != T_STRING) continue;
+
+            /* 运行标志 = 1 → eval(src) → = 0 (0x1000b2c1-0x1000b2f1) */
+            g_script_running = 1;                /* 原版 0x10173478 */
+            rb_eval_string_protect(RSTRING(src)->ptr, &state);
+            g_script_running = 0;
+            if (state) goto exception;
+        }
+    }
+
+    /* 正常完成: 清理链 → 结束 (原版 v18=false → return false) */
+    rgss_cleanup_pass();
+    return 0;
+
+exception:
+    /* 原版 LABEL_29: $!.type.to_s == "Reset" → 清理链+重启; 否则弹窗+退出。
+     * 补充分支: SystemExit (Graphics.update 窗口关闭路径 / 脚本显式 exit)
+     * → 清理链 + 干净退出, 不弹窗。 */
+    {
         VALUE err = rb_gv_get("$!");
         if (!NIL_P(err)) {
-            VALUE msg = rb_funcall(err, rb_intern("message"), 0);
-            char eb[2048];
-            snprintf(eb, sizeof eb, "%s", StringValueCStr(msg));
-            logmsg("[load] ERROR: %s", eb);
-            MessageBoxA(g_hwnd, eb, "RGSS Error", MB_ICONWARNING);
-        } else {
-            logmsg("[load] state=%d but $! is nil", state);
-        }
-        return 0;
-    }
-    if (NIL_P(n)) { logmsg("[load] result is nil!"); return 0; }
-    int count = NUM2INT(n);
-    logmsg("[load] section count=%d", count);
-    if (count <= 0) return 0;
-
-    /* 2. 逐段执行 */
-    for (int i = 0; i < count; i++) {
-        snprintf(code, sizeof code, "'Section%03d'", i);
-        rb_eval_string_protect(code, &state);
-        if (state) continue;
-
-        snprintf(code, sizeof code, "$RGSS_SCRIPTS[%d][3]", i);
-        VALUE src = rb_eval_string_protect(code, &state);
-        if (state || NIL_P(src)) continue;
-
-        g_running = 1;
-        logmsg("[exec] section %d (%d bytes)", i, (int)RSTRING(src)->len);
-        if (i == 93) {
-            /* 追踪: 每 10 帧记录一次 Graphics.update 调用 */
-            int st2 = 0;
-            rb_eval_string_protect(
-                "$__gfx_calls = 0;"
-                "module Kernel;"
-                "  alias_method :__orig_gfx_update, :update if false;"
-                "end;"
-                "class << Graphics;"
-                "  alias_method :__orig_update, :update;"
-                "  def update; $__gfx_calls += 1;"
-                "    if $__gfx_calls <= 3 || $__gfx_calls % 60 == 0;"
-                "      File.open('rgss_trace.log','a'){|f| f.puts \"[gfx] #{$__gfx_calls}\"};"
-                "    end;"
-                "    __orig_update;"
-                "  end;"
-                "end;", &st2);
-            logmsg("[trace] Graphics.update hooked, state=%d", st2);
-        }
-        if (i == 93) {
-            fprintf(stderr, "[DBG] about to eval Main (%d bytes)\n", (int)RSTRING(src)->len);
-            fflush(stderr);
-        }
-        rb_eval_string_protect(StringValueCStr(src), &state);
-        if (i == 93) {
-            fprintf(stderr, "[DBG] Main eval returned state=%d\n", state);
-            fflush(stderr);
-            if (state) {
-                VALUE e = rb_gv_get("$!");
-                VALUE m = NIL_P(e) ? rb_str_new2("(nil)") : rb_funcall(e, rb_intern("message"), 0);
-                fprintf(stderr, "[DBG] Main error: %s\n", StringValueCStr(m));
-                fflush(stderr);
+            const char *cname = rb_obj_classname(err);
+            if (cname != NULL && strcmp(cname, "Reset") == 0) {
+                rgss_cleanup_pass();
+                return 1;
+            }
+            if (cname != NULL && strcmp(cname, "SystemExit") == 0) {
+                rgss_cleanup_pass();
+                return 0;
             }
         }
-        g_running = 0;
-        /* 段 93 (Main) 之后检查场景状态 */
-        if (i >= 92) {
-            int s2 = 0;
-            VALUE sc = rb_eval_string_protect("$scene.class.to_s rescue 'nil'", &s2);
-            logmsg("[after] section %d state=%d $scene=%s", i, state,
-                   (NIL_P(sc) ? "nil" : StringValueCStr(sc)));
-            VALUE fc = rb_eval_string_protect("Graphics.frame_count.to_s rescue '?'", &s2);
-            logmsg("[after] Graphics.frame_count=%s",
-                   (NIL_P(fc) ? "nil" : StringValueCStr(fc)));
-        }
-
-        if (state) {
-            VALUE err = rb_gv_get("$!");
-            /* Reset 异常 → 重启 */
-            if (!NIL_P(err)) {
-                VALUE cls = rb_funcall(err, rb_intern("class"), 0);
-                VALUE cname = rb_funcall(cls, rb_intern("to_s"), 0);
-                if (strcmp(StringValueCStr(cname), "Reset") == 0) {
-                    return 2;   /* 重启信号 */
-                }
-                VALUE msg = rb_funcall(err, rb_intern("message"), 0);
-                char buf[2048];
-                snprintf(buf, sizeof buf, "%s: %s",
-                         StringValueCStr(cname), StringValueCStr(msg));
-                logmsg("[error] section %d: %s", i, buf);
-                /* 打印 Ruby backtrace, 定位具体脚本行 */
-                {
-                    int bst = 0;
-                    VALUE bt = rb_eval_string_protect(
-                        "$! && $!.backtrace ? $!.backtrace[0, 15].join(' <- ') : '(no backtrace)'",
-                        &bst);
-                    if (!bst && !NIL_P(bt))
-                        logmsg("[backtrace] %s", StringValueCStr(bt));
-                }
-                MessageBoxA(g_hwnd, buf, "RGSS Error", MB_ICONWARNING);
-            }
-            return 0;
-        }
+        show_script_error();
+        return -1;
     }
-    return 1;
 }
 
-/* ---------- 导出入口 ---------- */
+/* ---------- 崩溃转储 (调试辅助, 原版无 — RGSS_DEBUG_TOOLS=0 时整体编译去除) ----------
+ * B44: 捕获未处理 SEH 异常, 输出寄存器/模块表/栈顶到 rgss_crash.log,
+ * 便于把崩溃地址换算成 DLL 偏移与反汇编对照。 */
+#if RGSS_DEBUG_TOOLS
+#include <tlhelp32.h>
 
-/* 崩溃定位: 记录未处理异常的地址(换算成 DLL 内偏移), 便于与反汇编对照 */
+void rgss_debug_cleanup(void)
+{
+    for (int i = 0; rgss_debug_log_names[i]; i++)
+        DeleteFileA(rgss_debug_log_names[i]);
+}
+
+static void dump_modules(FILE *f, DWORD crash_ip)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32W me;   /* 显式 W 版: szModule 恒为宽字符, 与 UNICODE 宏无关 */
+    me.dwSize = sizeof me;
+    if (Module32FirstW(snap, &me)) {
+        fprintf(f, "[modules]\n");
+        do {
+            DWORD lo = (DWORD)(DWORD_PTR)me.modBaseAddr;
+            fprintf(f, "  %08lX-%08lX %ls%s\n", lo, lo + me.modBaseSize - 1,
+                    me.szModule,
+                    (crash_ip >= lo && crash_ip < lo + me.modBaseSize) ? "  <-- crash" : "");
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+}
+
 static LONG WINAPI rgss_crash_filter(EXCEPTION_POINTERS *ep)
 {
-    FILE *f = fopen("rgss_crash.log", "a");
-    if (f) {
+    FILE *f = RGSS_LOG_FOPEN("rgss_crash.log");
+    if (!f) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT *c = ep->ContextRecord;
+    DWORD ip = (DWORD)ep->ExceptionRecord->ExceptionAddress;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "[crash] %04d-%02d-%02d %02d:%02d:%02d code=0x%08lX addr=0x%08lX\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+            (unsigned long)ep->ExceptionRecord->ExceptionCode, (unsigned long)ip);
+    {
         DWORD base = (DWORD)(DWORD_PTR)GetModuleHandleA("RGSS202E.dll");
-        DWORD ip = (DWORD)ep->ExceptionRecord->ExceptionAddress;
-        fprintf(f, "[crash] code=0x%08lX addr=0x%08lX dll_base=0x%08lX offset=0x%lX",
-                (unsigned long)ep->ExceptionRecord->ExceptionCode,
-                (unsigned long)ip, (unsigned long)base,
+        fprintf(f, "  dll_base=0x%08lX offset=0x%lX\n", base,
                 ip >= base ? (unsigned long)(ip - base) : 0ul);
-        if (ep->ExceptionRecord->ExceptionCode == 0xC0000005L &&
-            ep->ExceptionRecord->NumberParameters >= 2)
-            fprintf(f, " op=%s target=0x%p",
-                    ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
-                    (void *)(DWORD_PTR)ep->ExceptionRecord->ExceptionInformation[1]);
-        fputc(10, f);
-        fclose(f);
     }
+    if (ep->ExceptionRecord->ExceptionCode == 0xC0000005L &&
+        ep->ExceptionRecord->NumberParameters >= 2)
+        fprintf(f, "  access=%s target=0x%p\n",
+                ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
+                (void *)(DWORD_PTR)ep->ExceptionRecord->ExceptionInformation[1]);
+    fprintf(f, "  EIP=%08lX ESP=%08lX EBP=%08lX EFL=%08lX\n",
+            (unsigned long)c->Eip, (unsigned long)c->Esp,
+            (unsigned long)c->Ebp, (unsigned long)c->EFlags);
+    fprintf(f, "  EAX=%08lX EBX=%08lX ECX=%08lX EDX=%08lX ESI=%08lX EDI=%08lX\n",
+            (unsigned long)c->Eax, (unsigned long)c->Ebx, (unsigned long)c->Ecx,
+            (unsigned long)c->Edx, (unsigned long)c->Esi, (unsigned long)c->Edi);
+    {   /* 栈顶 16 个双字 (地址=值) */
+        DWORD *sp = (DWORD *)(DWORD_PTR)c->Esp;
+        fprintf(f, "  stack:");
+        for (int i = 0; i < 16; i++) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(sp + i, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) break;
+            fprintf(f, " %08lX", sp[i]);
+        }
+        fprintf(f, "\n");
+    }
+    dump_modules(f, ip);
+    fclose(f);
     return EXCEPTION_CONTINUE_SEARCH;
 }
-
-int __cdecl rgss_game_main(int argc_unused, int b, int c)
+#else
+/* rgss_debug_cleanup 由 debug.h 提供 (空实现) */
+static LONG WINAPI rgss_crash_filter(EXCEPTION_POINTERS *ep)
 {
+    (void)ep;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
+/* ---------- 导出入口 ---------- */
+int __cdecl rgss_game_main(int a, int b, int c)
+{
+    /* 过滤器必须最先安装: 自测崩溃/任何早期崩溃都要能被捕获 */
     SetUnhandledExceptionFilter(rgss_crash_filter);
-        int a = argc_unused;
-    logmsg("[main] RGSSGameMain(a=0x%X, b=0x%X, c=0x%X) IsWindow(a)=%d",
-           (unsigned)a, (unsigned)b, (unsigned)c, IsWindow((HWND)(DWORD_PTR)a));
-    if (IsWindow((HWND)(DWORD_PTR)b)) logmsg("  b is also a window");
-    if (IsWindow((HWND)(DWORD_PTR)c)) logmsg("  c is also a window");
 
-    /* 阶段 B: 注册图形类（原版 CGameFrame::Run 首步 sub_10009F40） */
-    rgss_register_phase_b();
+#if RGSS_DEBUG_TOOLS
+    /* B44: 启动即清理上一轮日志 (运行期不再累积) */
+    rgss_debug_cleanup();
+    /* 崩溃转储通路自测: RGSS_DEBUG_CRASH_TEST=1 时启动即空指针自毁 */
     {
-        int st = 0;
-        VALUE r1 = rb_eval_string_protect("defined?(Bitmap).to_s", &st);
-        VALUE r2 = rb_eval_string_protect("defined?(Graphics).to_s", &st);
-        VALUE r3 = rb_eval_string_protect("defined?(Sprite).to_s", &st);
-        VALUE r4 = rb_eval_string_protect("defined?(Input).to_s", &st);
-        logmsg("[phaseB] Bitmap=%s Graphics=%s Sprite=%s Input=%s",
-               NIL_P(r1) ? "nil" : StringValueCStr(r1),
-               NIL_P(r2) ? "nil" : StringValueCStr(r2),
-               NIL_P(r3) ? "nil" : StringValueCStr(r3),
-               NIL_P(r4) ? "nil" : StringValueCStr(r4));
+        char v[4];
+        if (GetEnvironmentVariableA("RGSS_DEBUG_CRASH_TEST", v, sizeof v) > 0) {
+            volatile int *p = (volatile int *)0;
+            *p = 1;   /* 故意崩溃 → rgss_crash.log */
+        }
     }
+#endif
 
-    /* 创建窗口（原版 544x416） */
-    /* 实测: Game.exe 传入的是 HMODULE(DLL基址), 不是窗口句柄。
-       原版 DLL 内部自行创建窗口, 我们也这样做。 */
-    /* Game.exe 可能把宿主窗口作为 GameMain 的参数传入 */
+    /* 原版 0x10002890: 读 $TEST 全局 → 旗标 (Qtrue=2) */
+    g_test_flag = (rb_gv_get("$TEST") == Qtrue);
+
+    /* 阶段 B: 注册图形类 (原版 CGameFrame::Run 首步 sub_10009F40) */
+    rgss_register_phase_b();
+
+    /* 窗口: 优先宿主窗口 (Game.exe), 否则自建 */
     if (IsWindow((HWND)(DWORD_PTR)a)) {
         g_hwnd = (HWND)(DWORD_PTR)a;
-        logmsg("[main] using HOST window=0x%X", (unsigned)g_hwnd);
         SetWindowLongW(g_hwnd, GWL_STYLE,
             GetWindowLongW(g_hwnd, GWL_STYLE) | WS_VISIBLE);
         ShowWindow(g_hwnd, SW_SHOW);
         UpdateWindow(g_hwnd);
     } else if (IsWindow((HWND)(DWORD_PTR)b)) {
         g_hwnd = (HWND)(DWORD_PTR)b;
-        logmsg("[main] using HOST window from b=0x%X", (unsigned)g_hwnd);
     } else {
         g_hwnd = create_game_window("RGSS Player", 544, 416);
-        logmsg("[main] created own window=0x%X", (unsigned)g_hwnd);
     }
     if (!g_hwnd) return 0;
     rgss_graphics_set_hwnd(g_hwnd, 544, 416);
 
-    read_scripts_path(g_scripts_fname, sizeof g_scripts_fname);
-
-    /* 外层重启循环（F12 / Reset 异常） */
-    for (;;) {
-        g_reset_requested = 0;
-        int rc = load_and_run_scripts(g_scripts_fname);
-        if (rc == 2) continue;        /* Reset → 重来 */
-        break;
-    }
-
-    /* 退出清理（原版字符串） */
+    /* 原版 0x1000b0e9: eval("Graphics._reset") — 大循环前一次 */
     {
         int st = 0;
-        rb_eval_string_protect(
-            "Graphics._reset;Input.update;Audio.me_stop;Audio.se_stop;"
-            "Audio.bgm_stop;Audio.bgs_stop;GC.start;", &st);
+        rb_eval_string_protect("Graphics._reset", &st);
     }
+
+    /* 大循环 (原版 while(true) @0x1000b0f6): Reset → 重启, 其余退出 */
+    for (;;) {
+        int rc = run_scripts_pass();
+        if (rc == 1) continue;   /* Reset 重启 */
+        break;                   /* 0 正常 / -1 错误 */
+    }
+
     if (g_hwnd) { DestroyWindow(g_hwnd); g_hwnd = NULL; }
     return 0;
 }

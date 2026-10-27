@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "ruby.h"
+#include "debug.h"
 
 extern VALUE rgss_bitmap_class(void);
 extern VALUE rgss_rect_class(void);
@@ -71,7 +72,7 @@ void rgss_render_present(void)
     BitBlt(g_rc.dc, 0, 0, g_rc.width, g_rc.height, g_rc.memdc, 0, 0, SRCCOPY);
     s_present_count++;
     if (s_present_count <= 3) {
-        FILE *f = fopen("rgss_render.log", "a");
+        FILE *f = RGSS_LOG_FOPEN("rgss_render.log");
         if (f) {
             fprintf(f, "[present] #%d dc=%p memdc=%p %dx%d bits=%p\n",
                     s_present_count, (void*)g_rc.dc, (void*)g_rc.memdc,
@@ -134,6 +135,23 @@ void rgss_render_blit(const SrcSurface *src,
                 uint32_t r = (sr * sa + dr * ia) / 255;
                 uint32_t g = (sg * sa + dg * ia) / 255;
                 uint32_t b = (sb * sa + db * ia) / 255;
+                *dp = 0xFF000000u | (r << 16) | (g << 8) | b;
+                break;
+            }
+            case 3:   /* 预乘 over (仅窗口 contents 合成内部使用)
+                       * draw_text 的混合器 (0x1009FE00) 对透明 dst 产出
+                       * rgb = src×f / a = f —— 即预乘形式; 原版的 contents
+                       * →屏幕合成不再乘 a: screen = src_rgb + dst×(1−a)。
+                       * 直通 alpha 合成会把 f 再乘一遍 (f²), 文字边缘变瘦。
+                       * 注意 src_rgb + dst×(1−a) 可以超过 255 (如 fa=128 的
+                       * 预乘 rgb=128f 与 bg 残余项相加), 必须钳制, 否则通道
+                       * 溢出污染相邻字节 (实测禁用项变黄)。 */
+            {
+                uint32_t dr = (*dp >> 16) & 0xFF, dg = (*dp >> 8) & 0xFF, db = *dp & 0xFF;
+                uint32_t ia = 255 - sa;
+                uint32_t r = sr + dr * ia / 255; if (r > 255) r = 255;
+                uint32_t g = sg + dg * ia / 255; if (g > 255) g = 255;
+                uint32_t b = sb + db * ia / 255; if (b > 255) b = 255;
                 *dp = 0xFF000000u | (r << 16) | (g << 8) | b;
                 break;
             }

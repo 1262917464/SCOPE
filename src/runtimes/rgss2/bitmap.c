@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <stdint.h>
 #include "ruby.h"
+#include "debug.h"
 
 typedef struct { int width, height; } PixelBuffer;
 typedef struct { PixelBuffer *buf; } BitmapImpl;
@@ -597,7 +598,7 @@ static VALUE bm_draw_text(int argc, VALUE *argv, VALUE self)
             GetTextFaceW(hdc, 256, face);
             WideCharToMultiByte(CP_UTF8, 0, face, -1, fu8, 512, NULL, NULL);
             TEXTMETRICW tm; GetTextMetricsW(hdc, &tm);
-            FILE *f = fopen("rgss_text.log", "a");
+            FILE *f = RGSS_LOG_FOPEN("rgss_text.log");
             if (f) {
                 fprintf(f, "[font] size=%d face=%s tmh=%ld\n",
                         fsize, fu8, (long)tm.tmHeight);
@@ -661,7 +662,7 @@ static VALUE bm_draw_text(int argc, VALUE *argv, VALUE self)
             {
                 static int dbg = 0;
                 if (dbg++ < 2) {
-                    FILE *f = fopen("rgss_text.log", "a");
+                    FILE *f = RGSS_LOG_FOPEN("rgss_text.log");
                     if (f) {
                         fprintf(f, "[txt] w=%d h=%d wlen=%d sbits=%p font=%s size=%d color=(%d,%d,%d,%d)\n",
                                 w, h, wlen, (void *)sbits, facename, fsize, fr, fg, fb, fa);
@@ -829,35 +830,65 @@ static int rgss_render_alpha(HDC hdc, const WCHAR *ws, int len,
     return pen;
 }
 
-/* alpha 图 → 位图写入 (原版 0x96680 的 text 模式)
- * 原版 draw_text 分两遍调用同一个混合器 (0x161F6 阴影 / 0x16214 正文):
- *   阴影遍色 = (字体alpha << 24)   即 AA000000
- *   正文遍色 = 字体色 ebx
- * 本实现的位图只存 (alpha, RGB)，窗口合成时才做 over；所以这里直接写
- * ARGB=(覆盖度×字体alpha, RGB)。实测该语义下阴影/禁用项观感最接近原版。 */
-static void rgss_write_replace(Bitmap *b, const unsigned char *amap, int aw, int ah,
-                               int dx, int dy,
-                               int cx0, int cy0, int cw, int chh,
-                               int cr, int cg, int cb, int alpha)
+/* alpha 图 → 位图写入 —— 照原版混合器逐通道公式精确还原
+ *
+ * 白盒依据 (原版反汇编):
+ *   0x1009FE00  MMX 文字混合内循环 (map 变体):
+ *                 a  = LUT[map_byte]            (纯文字 LUT=恒等)
+ *                 f  = F[a]                     (16bit 因子)
+ *                 out = dst + (src−dst)*f >> 8  (RGBA 四通道)
+ *   0x100A9790  F 表初始化: F[0]=0, F[a]=a+1 (0x100A9820 循环, +0x10001 步进)
+ *   0x161F6/0x16214  draw_text 两遍 blit: 阴影 src=(0,0,0,字体alpha),
+ *                 正文 src=(字体色,字体alpha)
+ * 所以权重 = (a+1)/256 而非 a/255; 字体 alpha 不乘进 a, 而是作为 src 的
+ * alpha 通道参与混合 —— 覆盖度只决定混合权重。
+ * 效果: AA 边缘像素 = 白压黑(阴影在下面), 比白压背景更暗, 与原版一致。 */
+static void rgss_write_over(Bitmap *b, const unsigned char *amap, int aw, int ah,
+                            int dx, int dy,
+                            int cx0, int cy0, int cw, int chh,
+                            int cr, int cg, int cb, int alpha)
 {
     int W = b->impl->buf->width, H = b->impl->buf->height;
     int stride = b->stride >> 2;
     int x, y;
+    /* 源色按字体 alpha 预乘: 原版的纯色 src tile 是用同一混合器画到透明
+     * 底上生成的 (rgb = color×fa/255, a = fa), 本函数等价于对该 tile
+     * 做 map 混合。fa=255 时不变; fa=128 (禁用项) 时 rgb=128 —— 由此
+     * contents 为一致预乘形式, 预乘 over 合成后才与原版一致
+     * (实测禁用项字芯 155 = 128 + bg×0.498, 而非预乘时的饱和 255)。 */
+    int sr = cr * alpha / 255;
+    int sg = cg * alpha / 255;
+    int sb = cb * alpha / 255;
     for (y = 0; y < ah; y++) {
         int ty = dy + y;
         if (ty < 0 || ty >= H || ty < cy0 || ty >= cy0 + chh) continue;
         for (x = 0; x < aw; x++) {
             int tx = dx + x;
-            int a;
-            uint32_t *dp;
+            int a, f, dr, dg, db, da;
+            uint32_t px, *dp;
             if (tx < 0 || tx >= W || tx < cx0 || tx >= cx0 + cw) continue;
             a = amap[(size_t)y * aw + x];
-            if (!a) continue;
-            a = a * alpha / 255;
-            if (a <= 0) continue;
+            if (!a) continue;              /* F[0]=0 → 原样 (0x100A97F7) */
+            f = a + 1;                     /* F[a]=a+1 (0x100A9820) */
             dp = &b->pixels[(size_t)stride * ty + tx];
-            *dp = ((a & 0xFF) << 24) | ((cr & 0xFF) << 16)
-                | ((cg & 0xFF) << 8) | (cb & 0xFF);
+            px = *dp;
+            da = (int)((px >> 24) & 0xFF);
+            dr = (int)((px >> 16) & 0xFF);
+            dg = (int)((px >> 8) & 0xFF);
+            db = (int)(px & 0xFF);
+            /* 四通道同式: out = dst + (src−dst)*f >> 8 (pmullw+psrlw 语义) */
+            {
+                int or_ = dr + (((sr - dr) * f) >> 8);
+                int og = dg + (((sg - dg) * f) >> 8);
+                int ob = db + (((sb - db) * f) >> 8);
+                int oa = da + (((alpha - da) * f) >> 8);
+                if (or_ < 0) or_ = 0; else if (or_ > 255) or_ = 255;
+                if (og < 0) og = 0; else if (og > 255) og = 255;
+                if (ob < 0) ob = 0; else if (ob > 255) ob = 255;
+                if (oa < 0) oa = 0; else if (oa > 255) oa = 255;
+                *dp = ((uint32_t)oa << 24) | ((uint32_t)or_ << 16)
+                    | ((uint32_t)og << 8) | (uint32_t)ob;
+            }
         }
     }
 }
@@ -931,7 +962,7 @@ static VALUE bm_draw_text(int argc, VALUE *argv, VALUE self)
     {
         static int dbg = 0;
         if (dbg++ < 6) {
-            FILE *f = fopen("rgss_text.log", "a");
+            FILE *f = RGSS_LOG_FOPEN("rgss_text.log");
             if (f) {
                 char fu8[256];
                 WideCharToMultiByte(CP_UTF8, 0, facename, -1, fu8, 256, NULL, NULL);
@@ -944,6 +975,41 @@ static VALUE bm_draw_text(int argc, VALUE *argv, VALUE self)
     if (!hf) return Qnil;
     HDC hdc = CreateCompatibleDC(NULL);
     HGDIOBJ oldf = SelectObject(hdc, hf);
+    {
+        static int dbg2 = 0;
+        if (dbg2++ < 4) {
+            /* 实测诊断: GDI 实际解析到的字面 + GGO 字形墨量 */
+            FILE *f = RGSS_LOG_FOPEN("rgss_text.log");
+            if (f) {
+                wchar_t act[LF_FACESIZE] = {0};
+                char au8[256] = {0};
+                TEXTMETRICW tm0;
+                MAT2 mt = { {0,1},{0,0},{0,0},{0,1} };
+                GLYPHMETRICS g0;
+                long ink = 0;
+                unsigned bbw = 0, bbh = 0;
+                long cellx = 0;
+                GetTextFaceW(hdc, LF_FACESIZE, act);
+                WideCharToMultiByte(CP_UTF8, 0, act, -1, au8, 256, NULL, NULL);
+                GetTextMetricsW(hdc, &tm0);
+                DWORD sz = GetGlyphOutlineW(hdc, L'\u7279', 6, &g0, 0, NULL, &mt);
+                if (sz != GDI_ERROR && sz) {
+                    BYTE *buf = (BYTE *)calloc(1, sz);
+                    if (GetGlyphOutlineW(hdc, L'\u7279', 6, &g0, sz, buf, &mt)) {
+                        int st = (g0.gmBlackBoxX + 3) & ~3;
+                        for (unsigned i = 0; i < g0.gmBlackBoxY; i++)
+                            for (int j = 0; j < (int)g0.gmBlackBoxX; j++)
+                                ink += buf[i * st + j];
+                    }
+                    free(buf);
+                }
+                bbw = g0.gmBlackBoxX; bbh = g0.gmBlackBoxY; cellx = g0.gmCellIncX;
+                fprintf(f, "[FACE] req_sz=%d actual=%s tmH=%ld cellX=%ld bb=%ux%u ink=%ld\n",
+                        fsize, au8, (long)tm0.tmHeight, cellx, bbw, bbh, ink);
+                fclose(f);
+            }
+        }
+    }
 
     int srclen = (int)RSTRING(vstr)->len;
     int wlen = MultiByteToWideChar(CP_UTF8, 0, RSTRING(vstr)->ptr, srclen, NULL, 0);
@@ -984,9 +1050,9 @@ static VALUE bm_draw_text(int argc, VALUE *argv, VALUE self)
                  * alpha=128 绘制完全替换, 禁用项才不会发黑。
                  * 位图的 alpha 字段由窗口合成 (rgss_render_blit) 消费。 */
                 if (shadow)
-                    rgss_write_replace(b, amap2, aw, ah, x - 2 + 1, y - 2 + 1,
+                    rgss_write_over(b, amap2, aw, ah, x - 2 + 1, y - 2 + 1,
                                        x, y, w, h, 0, 0, 0, fa);
-                rgss_write_replace(b, amap2, aw, ah, x - 2, y - 2,
+                rgss_write_over(b, amap2, aw, ah, x - 2, y - 2,
                                    x, y, w, h, fr, fg, fb, fa);
                 free(amap2);
             }

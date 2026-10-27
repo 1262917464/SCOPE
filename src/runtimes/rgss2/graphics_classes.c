@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include "ruby.h"
+#include "debug.h"
 
 VALUE rgss_bitmap_class(void);
 VALUE rgss_color_class(void);
@@ -53,14 +54,30 @@ extern VALUE rgss_bitmap_class(void);
 
 /* ================= Graphics ================= */
 long rgss_sprite_count_dbg(void);
+/* 原版 0x100014a0: 每帧检查 F12, 按下则 raise 类名 "Reset" 的异常,
+ * 从 eval 冒出到 RGSSGameMain 大循环实现重启。
+ * 原版调用点: Graphics.update(0x10007b21/0x7b81)、fadeout(0x10007ea5)、
+ * fadein(0x10007f65)、transition(0x10008270/0x82ed)。 */
+void rgss_f12_check(void);
+/* 原版 Graphics.update/wait/fadeout/fadein/transition 在帧更新 (0x10001890)
+ * 返回 0 (窗口已关闭) 时 eval("exit 0", 字符串 0x100ff598, 无保护 eval
+ * 0x10033050) — SystemExit 从 Ruby 场景循环冒泡到 RGSSGameMain 干净退出。
+ * 重建等价: 直接 raise SystemExit (与 Kernel#exit 同机制)。 */
+static void gfx_window_close_check(void)
+{
+    if (!g_hwnd || !IsWindow(g_hwnd))
+        rb_raise(rb_eSystemExit, "exit");
+}
 static VALUE gfx_update(VALUE mod)
 {
     (void)mod;
+    rgss_f12_check();
     MSG msg;
     while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+    gfx_window_close_check();   /* 原版 0x10007b31: !frame_update → exit 0 */
     /* 帧率限制: 原版按 frame_rate 限帧 (默认 60)。
      * 没有限帧时游戏跑满 CPU, 且光标闪烁等帧同步效果完全失真 */
     {
@@ -93,7 +110,7 @@ static VALUE gfx_update(VALUE mod)
     rgss_compose_scene();
     rgss_render_present();
     if (g_frame_count <= 3 || (g_frame_count % 60) == 0) {
-        FILE *f = fopen("rgss_render.log", "a");
+        FILE *f = RGSS_LOG_FOPEN("rgss_render.log");
         if (f) { fprintf(f, "[gfx] frame=%d bits=%p sprites=%d win=0x%X\n",
                          g_frame_count, rgss_render_get_bits(),
                          (int)rgss_sprite_count_dbg(), (unsigned)g_hwnd); fclose(f); }
@@ -101,7 +118,7 @@ static VALUE gfx_update(VALUE mod)
     /* 诊断: 每 5000 帧记录场景名, 确认主循环归属 */
     if (g_frame_count == 5000) {
         VALUE sc = rb_gv_get("$scene");
-        FILE *f = fopen("rgss_caller.log", "a");
+        FILE *f = RGSS_LOG_FOPEN("rgss_caller.log");
         if (f) {
             fprintf(f, "[caller] frame=%d scene=%s nil=%d\n", g_frame_count,
                     NIL_P(sc) ? "nil" : rb_obj_classname(sc), NIL_P(sc));
@@ -140,11 +157,27 @@ static VALUE gfx_transition(VALUE m, int argc, VALUE *argv)
 static VALUE gfx_wait(VALUE m, VALUE vframes)
 {
     int n = NUM2INT(vframes);
-    for (int i = 0; i < n; i++) gfx_update(m);
+    for (int i = 0; i < n; i++) {
+        rgss_f12_check();
+        gfx_window_close_check();   /* 原版 0x10007b93: 每迭代检查 */
+        gfx_update(m);
+    }
     return Qnil;
 }
-static VALUE gfx_fadeout(VALUE m, VALUE vframes) { (void)m; (void)vframes; return Qnil; }
-static VALUE gfx_fadein(VALUE m, VALUE vframes) { (void)m; (void)vframes; return Qnil; }
+static VALUE gfx_fadeout(VALUE m, VALUE vframes)
+{
+    (void)m; (void)vframes;
+    rgss_f12_check();       /* 原版 0x10007ea5 */
+    gfx_window_close_check();   /* 原版 0x10007eb9 */
+    return Qnil;
+}
+static VALUE gfx_fadein(VALUE m, VALUE vframes)
+{
+    (void)m; (void)vframes;
+    rgss_f12_check();       /* 原版 0x10007f65 */
+    gfx_window_close_check();   /* 原版 0x10007f79 */
+    return Qnil;
+}
 static VALUE gfx_snap_to_bitmap(VALUE m)
 {
     (void)m;
@@ -159,9 +192,11 @@ static VALUE gfx_resize_screen(VALUE m, VALUE vw, VALUE vh)
     g_screen_h = NUM2INT(vh);
     return Qnil;
 }
-/* 小工具: 往日志文件追加一行 (变参), 返回是否成功 */
+/* 小工具: 往日志文件追加一行 (变参), 返回是否成功。
+ * 受 RGSS_DEBUG_TOOLS 门控 (debug.h): 关闭时恒不写。 */
 static int f_open_log(const char *path, const char *fmt, ...)
 {
+#if RGSS_DEBUG_TOOLS
     FILE *f = fopen(path, "a");
     if (!f) return 0;
     va_list ap; va_start(ap, fmt);
@@ -170,11 +205,17 @@ static int f_open_log(const char *path, const char *fmt, ...)
     fputc(10, f);
     fclose(f);
     return 1;
+#else
+    (void)path; (void)fmt;
+    return 0;
+#endif
 }
 
 void rgss_compose_scene(void);
 
 static VALUE gfx_reset(VALUE m) { (void)m; g_frame_count = 0; g_frozen = 0; return Qnil; }
+
+int rgss_current_frame_rate(void) { return g_frame_rate; }
 
 /* ================= Input =================
  * 依据原版 CInput 布局 (0x138a0 构造函数 + 0x13940 采样 + 0x13c40 更新):
@@ -336,7 +377,7 @@ static VALUE input_update(VALUE m)
         if (any) {
             static int last_any = -1;
             if (any != last_any || g_rep_count <= 3) {
-                FILE *f = fopen("rgss_input.log", "a");
+                FILE *f = RGSS_LOG_FOPEN("rgss_input.log");
                 if (f) {
                     fprintf(f, "[in] #%ld keys=", call_count);
                     for (i = 1; i < RGSS_KEY_NUM; i++)
@@ -348,7 +389,7 @@ static VALUE input_update(VALUE m)
             }
             last_any = any;
         } else if (call_count == 1 || (call_count % 300) == 0) {
-            FILE *f = fopen("rgss_input.log", "a");
+            FILE *f = RGSS_LOG_FOPEN("rgss_input.log");
             if (f) {
                 fprintf(f, "[in] #%ld idle (update 被调用, 无按键)\n", call_count);
                 fclose(f);
@@ -792,7 +833,7 @@ static VALUE window_initialize(int argc, VALUE *argv, VALUE self)
     w->cursor_rect = rb_class_new_instance(4, ra, rgss_rect_class());
     win_register(w);
     {
-        FILE *f = fopen("rgss_window.log", "a");
+        FILE *f = RGSS_LOG_FOPEN("rgss_window.log");
         if (f) { fprintf(f, "[win] created w=%d h=%d x=%.0f y=%.0f count=%d\n",
                          w->width, w->height, w->x, w->y, g_window_count); fclose(f); }
     }
@@ -840,7 +881,7 @@ static VALUE window_width(VALUE s) { return INT2FIX(GET_WIN(s)->width); }
 static VALUE window_width_set(VALUE s, VALUE v)
 {
     GET_WIN(s)->width = NUM2INT(v);
-    FILE *f = fopen("rgss_window.log", "a");
+    FILE *f = RGSS_LOG_FOPEN("rgss_window.log");
     if (f) { fprintf(f, "[win] width=%d\n", GET_WIN(s)->width); fclose(f); }
     return v;
 }
@@ -848,7 +889,7 @@ static VALUE window_height(VALUE s) { return INT2FIX(GET_WIN(s)->height); }
 static VALUE window_height_set(VALUE s, VALUE v)
 {
     GET_WIN(s)->height = NUM2INT(v);
-    FILE *f = fopen("rgss_window.log", "a");
+    FILE *f = RGSS_LOG_FOPEN("rgss_window.log");
     if (f) { fprintf(f, "[win] height=%d\n", GET_WIN(s)->height); fclose(f); }
     return v;
 }
@@ -1482,6 +1523,19 @@ static void draw_window_skin(WindowVal *w, int wx, int wy, int ww, int wh)
     }
 }
 
+/* 原版主循环每轮清理的 ×6 (0x100048F0/0x1000E080/0x1000F970/0x1000BF70/
+ * 0x10012100/0x10010EA0): 遍历引擎对象注册链表, 逐个 vtable[0](1) dispose 并摘链。
+ * 重建等价: 清空三张注册表 (Sprite/Window/Tilemap), 使 Reset 后旧场景对象
+ * 不再被合成。Viewport/Plane 尚无注册表 (差异清单 S3/S4)。
+ * 注: 原版 dispose 会置引擎侧 disposed 语义; 重建的对象由 Ruby GC 释放,
+ * 孤儿 Ruby 对象的 disposed? 读取引擎字段仍为 false — 可感知差异登记于 B49。 */
+void rgss_engine_reset_registries(void)
+{
+    g_sprite_count = 0;
+    g_window_count = 0;
+    g_tilemap_count = 0;
+}
+
 void rgss_compose_scene(void)
 {
     if (!rgss_render_get_bits()) return;
@@ -1529,7 +1583,7 @@ void rgss_compose_scene(void)
         static int s_wlog;
         if (s_wlog < 3) {
             s_wlog++;
-            FILE *f = fopen("rgss_window.log", "a");
+            FILE *f = RGSS_LOG_FOPEN("rgss_window.log");
             if (f) {
                 fprintf(f, "[compose] count=%d", g_window_count);
                 for (int k = 0; k < g_window_count; k++) {
@@ -1566,7 +1620,7 @@ void rgss_compose_scene(void)
                 if (cw > 0 && ch > 0)
                     rgss_render_blit(&c, wx + 16 - (int)w->ox, wy + 16 - (int)w->oy,
                                      0, 0, cw, ch, cw, ch,
-                                     (int)(w->contents_opacity * w->openness / 255), 0);
+                                     (int)(w->contents_opacity * w->openness / 255), 3);
             }
         }
     }

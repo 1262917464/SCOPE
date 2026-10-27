@@ -23,6 +23,10 @@ SRCS_CXX := image.cpp
 OBJS     := $(SRCS_C:%.c=$(OUTDIR)/%.o) $(SRCS_CXX:%.cpp=$(OUTDIR)/%.o) \
             $(OUTDIR)/win32api.o $(OUTDIR)/zlib_ext.o $(OUTDIR)/rpg_src.o
 
+# 调试辅助开关 (debug.h): 1=默认, 日志+崩溃转储可用; 0=1:1 洁净构建, 零日志副作用
+RGSS_DEBUG_TOOLS ?= 1
+CFLAGS += -DRGSS_DEBUG_TOOLS=$(RGSS_DEBUG_TOOLS)
+
 CFLAGS += -I. -Iext -I$(RB) -I$(RB)/win32
 
 all: $(TARGET)

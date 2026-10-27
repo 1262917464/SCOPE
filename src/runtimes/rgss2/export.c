@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include "ruby.h"
+#include "debug.h"
 
 /* ---------- 全局状态 (地址对照原版) ---------- */
 static int   g_running;          /* 原版 0x10173478: 脚本运行标志 */
@@ -37,7 +38,7 @@ __declspec(dllexport) int __cdecl RGSSInitialize2(int hwnd)
     ruby_init();
     ruby_script("rgss-rebuild");
     g_rgss_hwnd = (HWND)(DWORD_PTR)hwnd;
-    { FILE *df = fopen("rgss_init.log","a");
+    { FILE *df = RGSS_LOG_FOPEN("rgss_init.log");
       if (df) { fprintf(df, "[init] param=%d(0x%X) stored=%p\n", hwnd, hwnd, (void*)g_rgss_hwnd); fclose(df); } }
 
     /* 阶段 A: 数据类注册 + Ruby 环境准备（原版 sub_10009E60 顺序） */

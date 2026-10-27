@@ -8,6 +8,7 @@
  */
 #include <windows.h>
 #include "ruby.h"
+#include "debug.h"
 
 void rgss_init_bitmap(VALUE super);
 void rgss_init_color(VALUE super);
@@ -71,7 +72,7 @@ void rgss_register_phase_a(void)
 /* ---------- 阶段 B: 图形类（CGameFrame::Run 首步） ---------- */
 static void plog(const char *m)
 {
-    FILE *f = fopen("rgss_phase.log", "a");
+    FILE *f = RGSS_LOG_FOPEN("rgss_phase.log");
     if (f) { fputs(m, f); fputc(10, f); fclose(f); }
 }
 

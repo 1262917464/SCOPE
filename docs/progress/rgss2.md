@@ -9,13 +9,16 @@
 |--------|------|------|
 | M1–M4 | 脱壳 → 模块地图 → Ruby 1.8.1 集成 → 对象层主干 | ✅ 完成 |
 | M5-a…M5-k | 主循环 / Init / 两阶段注册 / Bitmap / Scripts / 骨架 / 数据类 / 渲染 / 输入 / 字体 / draw_text | ✅ 完成 |
+| M5-k* | 文字混合器白盒还原（F[a]=a+1 查表式，阴影偏淡修正）+ 字体集合截断修复 | ✅ 完成 |
+| M5-l | review+整修线：RGSSGameMain 对齐（F12 Reset / $TEST / 主循环架构 / B49 清理链 / B43 exit 0 / B44 日志改造+崩溃转储） | ✅ 完成（2026-10-28，销账见差异清单 §四） |
 | M6 | 自动对照测试 + 研究文档 + 地址映射表 | ⬜ 未开始 |
 
 ## 当前状态（一句话）
 
 **重建版 DLL 已能从标题画面一路进入游戏地图**：标题渲染、`Input.trigger?` 采键、
 `Scene_Title → Scene_Map` 切换、地图图块与角色精灵渲染、光标闪烁、中文 draw_text
-（GetGlyphOutlineW 自绘字形 + REPLACE 语义）均按原版路径还原。
+（GetGlyphOutlineW 自绘字形 + 原版 F[a]=a+1 查表混合）均按原版路径还原；
+文字粗细/阴影与原生对齐（近白像素比 0.997，暗环带 B 96.1 vs 93.0）。
 
 验证截图：`local/test/Project3_rebuild/kt_00_title.png`、`kt_01_after_enter.png`；
 对比图 `docs/assets/window_9slice_compare.png`；原版基准 `local/test/Project3_orig/kt_01.png`。
@@ -31,7 +34,7 @@
    kind 0-31→TileA2，32-47→TileA1，48-79→TileA3，80+→TileA4。
    反汇编材料：`local/build/full_disasm.txt`（离线 objdump，基址 0x10000000）。
 6. 音频（MCI/DirectSound）未实现。
-7. 鼠标控制（原版 0x13940 前半段的鼠标→方向映射）未实现。
+7. ~~鼠标控制~~ **更正（2026-10-28）**：原版无鼠标支持。0x13940 前半段实为**手柄摇杆→方向映射**（joyGetPosEx，见差异清单 S8/S9 销案记录）。
 
 ## M5-h 剩余（原 §八）
 
