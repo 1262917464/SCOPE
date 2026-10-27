@@ -95,3 +95,6 @@ __pycache__/
 *~
 Thumbs.db
 desktop.ini
+
+# 临时占位：工作台整体不入库（刀 4 会重写为完整版 .gitignore）
+/local/
