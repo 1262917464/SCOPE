@@ -3,6 +3,12 @@
 **Source-Code Oriented role-Play game Engine** — A source-level reconstruction of classic
 RPG Maker runtimes for 1:1 behavioral fidelity.
 
+> [!WARNING]
+> **本项目 100% 由 AI 幻觉产生，从一句话开始。**
+>
+> 起点仅仅是一句话——"把 RGSS 用 C 重建出来"，并向 AI 投喂一些测试工程和 RPG Maker DLL。
+> 然后 AI 就自己源源不断的在缝合代码石块了，直到变成一个扭曲的毫无美感的丑陋的不可名状之物。
+
 > SCOPE 是一个**重建计划**（Project），不是单一引擎实体：把经典 RPG Maker 运行库
 > （RGSS1 / RGSS2 / RGSS3 / RM2K）的完整逻辑用 C 源码级还原，产出与原版
 > **1:1 行为等价**的同名 drop-in DLL（Game.exe 不动）。壳（ASPack）本身不还原。
@@ -108,3 +114,5 @@ local/test/Project3_rebuild/Game.exe                    # ★真实游戏（标�
 
 **All Rights Reserved** — 详见 [LICENSE](LICENSE)。简言之：源码与文档保留全部权利，
 公开可读、供研究参考，不授权复用；仓库不含任何 Enterbrain 二进制；Ruby 上游按 Ruby License。
+
+再次强调：本项目从一句话起步，全部产出（源码、工具、文档）均为 AI 幻觉碰巧幸存的产物，没有人工审查背书，请降低预期后再继续阅读。
