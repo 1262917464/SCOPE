@@ -980,6 +980,7 @@ typedef struct {
     double x, y, z, ox, oy;
     int visible, opacity, blend_type;
     int disposed;
+    int anim;   /* 原版 C++ +0x10070 动画计数器 (0x10016d50: update 时 +1) */
 } TilemapVal;
 static void tilemap_free(void *p) { free(p); }
 static void tilemap_mark(void *p)
@@ -1030,7 +1031,7 @@ static VALUE tilemap_dispose(VALUE s)
     return Qnil;
 }
 static VALUE tilemap_disposed_p(VALUE s) { return GET_TILEMAP(s)->disposed ? Qtrue : Qfalse; }
-static VALUE tilemap_update(VALUE s) { (void)s; return Qnil; }
+static VALUE tilemap_update(VALUE s) { GET_TILEMAP(s)->anim++; return Qnil; }
 
 /* bitmaps: 9 张图块素材 (TileA1..A5, TileB..E), 脚本按索引写入。
  * 原版是内建 9 元素数组, 索引越界会抛 IndexError; 这里同样用 Ruby Array。 */
@@ -1589,18 +1590,16 @@ static int bitmap_surface(VALUE vbmp, SrcSurface *out)
 }
 
 /* ================= Tilemap 绘制 =================
- * VX 图块 32x32; map_data 为 Table (宽, 高, 层数)。
- * tile_id 编码 (对照原版渲染实测):
- *   0        = 空白
- *   id >= 1  : kind = (id-1)/48, shape = (id-1)%48
- *              kind  0-31 -> TileA2 第 kind    块 (2x3 格式, 64x96)
- *              kind 32-47 -> TileA1 第 kind-32 块 (海水/海滩)
- *              kind 48-79 -> TileA3 第 kind-48 块
- *              kind 80+   -> TileA4 第 kind-80 块
- * 实测锚点: id 2048 -> kind42 -> A1#10 = 深海 (本图 96.76% 的海面)
- *           id 1537 -> kind32 -> A1#0  = 海滩 (沙洲路径)
- * 自动图块 2x3 块含 6 片 32x32; 内部(四邻同) 用自平铺片, 边角用对应角片。
- */
+ * 按 M5-o 解码实装 (docs/analysis/rgss2/M5-o_自动图块48形状表_只读解码.md):
+ * 原版 0x10017340 = 单图块绘制 (ctx,dx,dy,tile_id)。
+ * map_data short 直接存合成 id: 0=空, id<0x800 普通块, id>=0x800 自动块
+ *   kind = (id-0x800)/48 (0-15=A1, 16-47=A2, 48-79=A3, 80-95=A4),
+ *   shape = (id-0x800)%48 (由编辑器烘焙, 引擎绘制期无邻接计算)。
+ * 自动块 = 4 个 16x16 四分块, 第 i 角源 = (qx*16+Xbase, qy*16+Ybase),
+ *   (qx,qy) = 形状表[shape] 第 i 项; 目标 = (dx+(i%2)*16, dy+(i/2)*16)。
+ * 实测锚点: id 2048 = kind0/shape0 = A1#0 全包围 (本图 96.76% 的海面)。 */
+#include "autotile_tables.h"
+
 VALUE rgss_tilemap_bitmap(VALUE tilemap, int index);
 
 static void draw_tile_cell(int dx, int dy, VALUE vbmp, int block_x, int block_y,
@@ -1632,40 +1631,119 @@ static void draw_tile_cell(int dx, int dy, VALUE vbmp, int block_x, int block_y,
     }
 }
 
-/* 把一个自动图块单元画到 (dx,dy)。vb = 9 元素 bitmaps 数组 */
-static void draw_autotile(int dx, int dy, VALUE vb, int kind, int shape,
-                          int up_s, int right_s, int down_s, int left_s)
+/* kind -> 位图槽位 / 源基点 (Xbase,Ybase) / 形状表 (原版 0x10017340 0x10017455 起):
+ * t = kind>>3。
+ * A1 (t=0, kind 0-15): bmp 0; kind 0: (0,0) T0 水面动画;
+ *   1: (0,96) T0 水面; 2: (192,0) T0; 3: (192,96) T0 (后三无动画);
+ *   4-15: X=((k&7)>>2)*256+(k&1)*192, Y=((((k&7)>>1)&1)+2*(t==1))*96,
+ *   偶->T0 静止, 奇->T2 瀑布动画。
+ * A2 (t=2..5): bmp 1, X=(k&7)*64, Y=(t-2)*96, T0, k&7==7 为环绕镜像 kind。
+ * A3 (t=6..9): bmp 2, X=(k&7)*64, Y=(t-6)*64, T1。
+ * A4 (t=10..11): bmp 3, X=(k&7)*64, Y=(5t-50)*16+(t偶?16:0), t偶->T0, t奇->T1。
+ * 水面动画: X += [0,64,128,64][(cnt/30)%4] (30 帧一步, 乒乓);
+ * 瀑布动画: Y += ((cnt/30)%3)*32 (垂直 3 帧)。 */
+static void autotile_geometry(int kind, int anim, int *bmp_idx, int *xb, int *yb,
+                              const unsigned char **tab)
 {
-    static const int sheet_index[4] = { 1, 0, 2, 3 };  /* A2,A1,A3,A4 在 bitmaps 里的槽位 */
-    int sheet, block, bw, bh;
-    if (kind < 32)      { sheet = 0; block = kind;      bw = 64; bh = 96; }
-    else if (kind < 48) { sheet = 1; block = kind - 32; bw = 64; bh = 96; }
-    else if (kind < 80) { sheet = 2; block = kind - 48; bw = 64; bh = 64; }
-    else                { sheet = 3; block = kind - 80; bw = 64; bh = 64; }
-    VALUE vsheet = rb_ary_entry(vb, sheet_index[sheet]);
-    if (NIL_P(vsheet)) return;
-
-    int bx = (block % 8) * 64, by = (block / 8) * bh;
-    /* 2x3 格式 6 片: 0=(0,0) 1=(1,0) 2=(0,1) 3=(1,1) 4=(0,2) 5=(1,2)
-     * 实测: 自平铺的内部片多为 (0,0)。四角片用 1..4。 */
-    int tl = (up_s && left_s)   ? 0 : 1;
-    int tr = (up_s && right_s)  ? 0 : 2;
-    int bl = (down_s && left_s) ? 0 : 3;
-    int br = (down_s && right_s)? 0 : 4;
-    struct { int piece, px, py; } q[4] = {
-        { tl, 0, 0 }, { tr, 32, 0 }, { bl, 0, 32 }, { br, 32, 32 }
-    };
-    for (int i = 0; i < 4; i++) {
-        int pc = q[i].piece;
-        draw_tile_cell(dx, dy, vsheet,
-                       bx + (pc % 2) * 32, by + (pc / 2) * 32, 32, 32,
-                       q[i].px, q[i].py);
+    int t = kind >> 3, k7 = kind & 7;
+    if (t == 0) {
+        *bmp_idx = 0; *tab = autotile_T0;
+        if (kind == 0)      { *xb = 0;   *yb = 0;  }
+        else if (kind == 1) { *xb = 0;   *yb = 96; }
+        else if (kind == 2) { *xb = 192; *yb = 0;  }
+        else if (kind == 3) { *xb = 192; *yb = 96; }
+        else {
+            *xb = ((k7 >> 2) * 256) + (kind & 1 ? 192 : 0);
+            *yb = (((k7 >> 1) & 1) + (t == 1 ? 2 : 0)) * 96;
+        }
+        if (kind & 1 && kind >= 4) {          /* 瀑布 (0x1001757e) */
+            *tab = autotile_T2;
+            *yb += ((anim / 30) % 3) * 32;
+        } else if (kind < 2) {                /* 水面 (0x10017530, kind 0/1) */
+            int f = (anim / 30) % 4;
+            *xb += (f == 1 || f == 3) ? 64 : (f == 2 ? 128 : 0);
+        }
+    } else if (t < 6) {                       /* A2 */
+        *bmp_idx = 1; *tab = autotile_T0;
+        *xb = k7 * 64; *yb = (t - 2) * 96;
+    } else if (t < 10) {                      /* A3 */
+        *bmp_idx = 2; *tab = autotile_T1;
+        *xb = k7 * 64; *yb = (t - 6) * 64;
+    } else {                                  /* A4 (0x10017601) */
+        *bmp_idx = 3; *tab = (t & 1) ? autotile_T1 : autotile_T0;
+        /* neg/sbb 链: t 偶 -> +0x10-0x10 = 0; t 奇 -> +0x10 = 16 */
+        *xb = k7 * 64; *yb = (t * 5 - 50) * 16 + ((t & 1) ? 16 : 0);
     }
 }
 
+/* 0x10017200 谓词: id 是"可投影/受影"A2-A3 块 (0xB00-0x10FF 且 kind%8 != 7) */
+static int autotile_castable(int id)
+{
+    if (id < 0xB00 || id > 0x10FF) return 0;
+    return ((id - 0x800) / 48) % 8 != 7;
+}
+
+/* 自动块: id>=0x800。anim 为该 tilemap 的动画计数器 (Tilemap#update +1) */
+static void draw_autotile(int dx, int dy, VALUE vb, int id, int anim)
+{
+    int kind = (id - 0x800) / 48, shape = (id - 0x800) % 48;
+    int bmp_idx, xb, yb;
+    const unsigned char *tab;
+    autotile_geometry(kind, anim, &bmp_idx, &xb, &yb, &tab);
+    VALUE vsheet = rb_ary_entry(vb, bmp_idx);
+    if (NIL_P(vsheet)) return;
+    int wrap7 = (bmp_idx == 1) && ((kind & 7) == 7);   /* 0x100176ee: A2 k%8==7 */
+
+    for (int i = 0; i < 4; i++) {
+        int qx = tab[shape * 8 + i * 2], qy = tab[shape * 8 + i * 2 + 1];
+        if (wrap7 && qy == 1) {               /* {0,3,2,1}[qx] 水平镜像 */
+            static const int lut[4] = { 0, 3, 2, 1 };
+            if (qx < 4) qx = lut[qx];
+        }
+        draw_tile_cell(dx, dy, vsheet, qx * 16 + xb, qy * 16 + yb, 16, 16,
+                       (i % 2) * 16, (i / 2) * 16);
+    }
+}
+
+/* 普通块 (id<0x800, 原版 0x10017372-0x10017452):
+ * idx = id>=0x600 ? 4 (A5) : (id>>8)+5 (B..E);
+ * x = ((id%8) + ((id>>7)&1)*8)*32; y = (((id%256)>>3)%16)*32; 32x32 一次 blit */
+static void draw_plain_tile(int dx, int dy, VALUE vb, int id)
+{
+    int idx = (id >= 0x600) ? 4 : (id >> 8) + 5;
+    VALUE vsheet = rb_ary_entry(vb, idx);
+    if (NIL_P(vsheet)) return;
+    int x = ((id % 8) + ((id >> 7) & 1) * 8) * 32;
+    int y = (((id % 256) >> 3) % 16) * 32;
+    draw_tile_cell(dx, dy, vsheet, x, y, 32, 32, 0, 0);
+}
+
+/* 阴影条 (原版 0x100177e0, 仅 layer 0, 调用点 0x10017bd9):
+ * 正上方格是"可投影墙" (0x10017200) 且当前格可受影时, 取墙 shape 的
+ * 角 2/3 (判定 T0[shape].byte[5]==5, qy==5 阴影延伸区), 源 = 16x8
+ * (qy*16+Ybase+8, 取该 quarter 下 8px), 画到当前格顶部 (dx+i*16, dy) */
+static void draw_wall_shadow(int dx, int dy, VALUE vb, int wall_id, int anim)
+{
+    int wkind = (wall_id - 0x800) / 48, wshape = (wall_id - 0x800) % 48;
+    int bmp_idx, wxb, wyb;
+    const unsigned char *tab;
+    autotile_geometry(wkind, anim, &bmp_idx, &wxb, &wyb, &tab);
+    if (tab != autotile_T0) return;           /* 原版只查 T0 */
+    if (tab[wshape * 8 + 5] != 5) return;
+    VALUE vsheet = rb_ary_entry(vb, bmp_idx);
+    if (NIL_P(vsheet)) return;
+    for (int i = 0; i < 2; i++) {
+        int qx = tab[wshape * 8 + 4 + i * 2], qy = tab[wshape * 8 + 5 + i * 2];
+        draw_tile_cell(dx, dy, vsheet, qx * 16 + wxb, qy * 16 + wyb + 8, 16, 8,
+                       i * 16, 0);
+    }
+}
+
+/* 角部暗块 (0x10017920, 需 A3/A4 墙) 未实装 — 本游戏地图无 A3/A4, 路径不可达;
+ * 0x100171a0 谓词保留解码记录: id∈0x610-0x7FF 或 autotile_castable(id)。 */
+
 static void draw_tilemap_layer(TilemapVal *t, VALUE vdata, int layer, int ox, int oy)
 {
-    { static int dbg = 0; if (dbg++ < 2 && f_open_log("rgss_tilemap.log", "[tl] layer=%d W=%d H=%d Z=%d bmpnil=%d tmaps=%d", layer, NUM2INT(rb_funcall(vdata, rb_intern("xsize"),0)), NUM2INT(rb_funcall(vdata, rb_intern("ysize"),0)), NUM2INT(rb_funcall(vdata, rb_intern("zsize"),0)), NIL_P(t->bitmaps), g_tilemap_count)) ; }
     int W = NUM2INT(rb_funcall(vdata, rb_intern("xsize"), 0));
     int H = NUM2INT(rb_funcall(vdata, rb_intern("ysize"), 0));
     int Z = NUM2INT(rb_funcall(vdata, rb_intern("zsize"), 0));
@@ -1685,17 +1763,28 @@ static void draw_tilemap_layer(TilemapVal *t, VALUE vdata, int layer, int ox, in
                                         INT2FIX(x), INT2FIX(y), INT2FIX(layer)));
             if (id == 0) continue;
             int dx = x * 32 - ox, dy = y * 32 - oy;
-            int kind = (id - 1) / 48, shape = (id - 1) % 48;
-            /* 邻接判定: 同层相邻格是否同一自动图块种类 */
-            int up = 0, down = 0, left = 0, right = 0;
-            if (y > 0)     { int n = NUM2INT(rb_funcall(vdata, rb_intern("[]"), 3, INT2FIX(x), INT2FIX(y-1), INT2FIX(layer))); up    = (n != 0) && ((n-1)/48 == kind); }
-            if (y < H - 1) { int n = NUM2INT(rb_funcall(vdata, rb_intern("[]"), 3, INT2FIX(x), INT2FIX(y+1), INT2FIX(layer))); down  = (n != 0) && ((n-1)/48 == kind); }
-            if (x > 0)     { int n = NUM2INT(rb_funcall(vdata, rb_intern("[]"), 3, INT2FIX(x-1), INT2FIX(y), INT2FIX(layer))); left  = (n != 0) && ((n-1)/48 == kind); }
-            if (x < W - 1) { int n = NUM2INT(rb_funcall(vdata, rb_intern("[]"), 3, INT2FIX(x+1), INT2FIX(y), INT2FIX(layer))); right = (n != 0) && ((n-1)/48 == kind); }
-            draw_autotile(dx, dy, vb, kind, shape, up, right, down, left);
+            if (id >= 0x800) {
+                if (id <= 0x800 + 96 * 48) draw_autotile(dx, dy, vb, id, t->anim);
+            } else {
+                draw_plain_tile(dx, dy, vb, id);
+            }
+            /* 阴影: 仅 layer 0 (原版 0x10017aef test ebp,ebp/jg 跳过);
+             * 0x10017b57: 当前格是 A3/A4 (0x1100-0x1FFF) 或环绕 kind 时跳过;
+             * 其余格若上方为墙则投影条。 */
+            if (layer == 0 && y > 0) {
+                int skip = (id >= 0x1100 && id <= 0x1FFF) ||
+                           ((id >= 0xB00 && id <= 0x10FF) && !autotile_castable(id));
+                if (!skip) {
+                    int up = NUM2INT(rb_funcall(vdata, rb_intern("[]"), 3,
+                                                INT2FIX(x), INT2FIX(y - 1), INT2FIX(layer)));
+                    if (autotile_castable(up))
+                        draw_wall_shadow(dx, dy, vb, up, t->anim);
+                }
+            }
         }
     }
 }
+
 
 /* ================= Window 9 宫格皮肤 =================
  * 皮肤 bitmap (Graphics/System/Window.png, 128x128) 布局 (像素级实测):
