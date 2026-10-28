@@ -11,6 +11,7 @@
 #include <string.h>
 #include "ruby.h"
 #include "debug.h"
+void rgss_raise_disposed(const char *msg);
 
 VALUE rgss_bitmap_class(void);
 VALUE rgss_color_class(void);
@@ -47,8 +48,11 @@ static int   g_frozen_active = 0;     /* freeze 置位, transition 结束清除 
 static int   g_frozen_alpha = 255;    /* 转场中冻结图权重 0..255 */
 static uint32_t *g_freeze_bits = NULL; /* +0x254 快照 */
 static int   g_freeze_w = 0, g_freeze_h = 0;
-static uint32_t *g_mask_bits = NULL;  /* 文件转场遮罩亮度 0..255 */
+static unsigned char *g_ft_mask = NULL; /* 文件转场遮罩亮度 0..255 (8bpp 语义) */
 static int   g_mask_w = 0, g_mask_h = 0, g_mask_vague = 40;
+static int   g_ft_active = 0;         /* 文件转场进行中 (kernel 0x100a5710 路径) */
+static int   g_ft_shifted = 0;        /* 渐变带起点 = threshold-0x100 (每帧推进) */
+extern int rgss_load_image(const char *path, unsigned int **out_bits, int *out_w, int *out_h);
 static int   g_screen_w = 544, g_screen_h = 416;
 static HWND  g_hwnd;
 
@@ -106,6 +110,32 @@ static void gfx_apply_display_rule(void)
     uint32_t *bits = (uint32_t *)rgss_render_get_bits();
     if (!bits) return;
     int w = rgss_render_width(), h = rgss_render_height(), n = w * h;
+    /* 文件转场 (kernel 0x100a5710 + 0x1009fe00):
+     * lut[mask]: mask<shifted→0; [shifted, shifted+vague)→(m-shifted)*255/vague;
+     * 其余→255。out = dst + (src−dst)*F[lut]>>8, F[a]=a+1 (0x1018bb90), packuswb 钳制。
+     * src=冻结图(+0x254), dst=实况帧。遮罩低字节先切到实况 (phase 固定 0xff)。 */
+    if (g_ft_active && g_ft_mask && g_freeze_bits &&
+        g_freeze_w == w && g_freeze_h == h && g_mask_w == w && g_mask_h == h &&
+        g_ft_shifted < 256) {
+        int band_end = g_ft_shifted + g_mask_vague;
+        if (band_end > 256) band_end = 256;
+        for (int i = 0; i < n; i++) {
+            int m = g_ft_mask[i];
+            int a = (m < g_ft_shifted) ? 0
+                  : (m < band_end)    ? (m - g_ft_shifted) * 255 / g_mask_vague
+                  :                     255;
+            int F = a + 1;
+            uint32_t f = g_freeze_bits[i], l = bits[i];
+            int r = (l >> 16 & 255) + (((int)(f >> 16 & 255) - (l >> 16 & 255)) * F >> 8);
+            int g = (l >>  8 & 255) + (((int)(f >>  8 & 255) - (l >>  8 & 255)) * F >> 8);
+            int b = (l       & 255) + (((int)(f       & 255) - (l       & 255)) * F >> 8);
+            if (r > 255) r = 255; if (r < 0) r = 0;
+            if (g > 255) g = 255; if (g < 0) g = 0;
+            if (b > 255) b = 255; if (b < 0) b = 0;
+            bits[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+        goto fade;
+    }
     int a = 0;
     if (g_frozen_active && g_freeze_bits && g_freeze_w == w && g_freeze_h == h)
         a = g_transition_mode ? g_frozen_alpha : 255;
@@ -120,6 +150,7 @@ static void gfx_apply_display_rule(void)
             bits[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
     }
+fade:
     int L = g_fade_level;   /* 黑幕强度; 原版遮罩绘制在转场层之上 */
     if (L < 0) L = 0;
     if (L > 255) L = 255;
@@ -248,7 +279,10 @@ static VALUE gfx_freeze(VALUE m)
  * vague 默认 0x28 (0x10008057);
  * 进转场 vtable+4(1) (0x100080b8), 黑幕清零 (0x100080d6);
  * 无文件名: 默认环 0x100082a0, 每帧冻结权重 255-(i+1)*255/dur 线性降 0, 帧步进;
- * 有文件名: 文件环 0x10008238, 遮罩着色器未解码 — 已知差异, 退化为同参数 crossfade;
+ * 有文件名: 文件环 0x10008238 (M5-n): 遮罩文件→亮度表, 每帧
+ *   threshold = 0x100 + (i+1)*0x100/dur (kernel 0x100a5710 约束 <=0x200、
+ *   %0x200!=0 → 末帧不绘制), shifted = threshold-0x100, 渐变带宽 = vague,
+ *   per-pixel lut[mask] → 0x1009fe00(F 表混合);
  * 尾声 vtable+4(0) (0x10008330), 释放转场资源 (0x1000833e)。
  * argc=-1 注册: Ruby 以 func(argc, argv, self) 调用。 */
 static VALUE gfx_transition(int argc, VALUE *argv, VALUE self)
@@ -258,13 +292,48 @@ static VALUE gfx_transition(int argc, VALUE *argv, VALUE self)
         rb_raise(rb_eArgError, "wrong number of arguments (%d for 0..3)", argc);
     int duration = 10;
     if (argc >= 1) duration = NUM2INT(argv[0]);
-    if (argc >= 2) rb_string_value_cstr(&argv[1]);   /* 字符串化, 对应 0x100808d0 */
+    const char *file = NULL;
+    if (argc >= 2) file = rb_string_value_cstr(&argv[1]);   /* 对应 0x100808d0 */
+    if (argc >= 3) g_mask_vague = NUM2INT(argv[2]);         /* 默认 0x28 (0x10008057) */
+    { FILE *f = RGSS_LOG_FOPEN("rgss_ft.log");
+      if (f) { fprintf(f, "[ft] enter dur=%d file=%s frozen=%d\n", duration,
+                       file ? file : "(null)", g_frozen_active); fclose(f); } }
     if (!g_frozen_active)
         gfx_capture_freeze();    /* 无 freeze 前置时以当前画面为转场源 */
     g_transition_mode = 1;
     g_fade_level = 0;            /* 0x10014770(+0x250,0x10,0) */
     g_brightness = 255;
-    if (duration >= 1) {
+    if (file && file[0]) {
+        /* 文件环 0x10008238: 遮罩上传一次 (0x10096d50), 每帧 lut 随 threshold 推进 */
+        unsigned int *bits = NULL;
+        int mw = 0, mh = 0;
+        if (rgss_load_image(file, &bits, &mw, &mh) && bits && mw > 0 && mh > 0) {
+            free(g_ft_mask);
+            g_ft_mask = (unsigned char *)malloc((size_t)mw * mh);
+            g_mask_w = mw; g_mask_h = mh;
+            for (int i = 0; i < mw * mh; i++) {
+                unsigned int p = bits[i];
+                /* 原版遮罩为 8bpp 灰度; 32bpp 源取亮度 (灰度遮罩下与原版一致) */
+                int r = p >> 16 & 255, g = p >> 8 & 255, b = p & 255;
+                g_ft_mask[i] = (unsigned char)((r * 77 + g * 151 + b * 28) >> 8);
+            }
+            free(bits);
+            g_ft_active = 1;
+            { FILE *f = RGSS_LOG_FOPEN("rgss_ft.log");
+              if (f) { fprintf(f, "[ft] mask loaded %dx%d\n", mw, mh); fclose(f); } }
+            if (duration >= 1) {
+                for (int i = 0; i < duration; i++) {
+                    /* 文件环 0x1000823a: threshold = 0x100 + (i+1)*0x100/dur */
+                    int threshold = 0x100 + (i + 1) * 0x100 / duration;
+                    g_ft_shifted = threshold - 0x100;
+                    gfx_step_frame();
+                }
+            }
+            g_ft_active = 0;
+            { FILE *f = RGSS_LOG_FOPEN("rgss_ft.log");
+              if (f) { fprintf(f, "[ft] file loop done\n"); fclose(f); } }
+        }
+    } else if (duration >= 1) {
         for (int i = 0; i < duration; i++) {
             g_frozen_alpha = 255 - ((i + 1) * 255) / duration;  /* 0x100082b4 */
             gfx_step_frame();
@@ -671,8 +740,8 @@ static VALUE sprite_dispose(VALUE self) { GET_SPRITE(self)->disposed = 1; return
 static VALUE sprite_disposed_p(VALUE self) { return GET_SPRITE(self)->disposed ? Qtrue : Qfalse; }
 
 #define SPR_ACC(name, field, type, conv, rconv) \
-    static VALUE sprite_##name(VALUE s) { return rconv(GET_SPRITE(s)->field); } \
-    static VALUE sprite_##name##_set(VALUE s, VALUE v) { GET_SPRITE(s)->field = conv(v); return v; }
+    static VALUE sprite_##name(VALUE s) { if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite"); return rconv(GET_SPRITE(s)->field); } \
+    static VALUE sprite_##name##_set(VALUE s, VALUE v) { if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite"); GET_SPRITE(s)->field = conv(v); return v; }
 
 SPR_ACC(x, x, double, NUM2DBL, rb_float_new)
 SPR_ACC(y, y, double, NUM2DBL, rb_float_new)
@@ -696,9 +765,11 @@ static VALUE sprite_visible_set(VALUE s, VALUE v) { GET_SPRITE(s)->visible = RTE
 static VALUE sprite_mirror(VALUE s) { return GET_SPRITE(s)->mirror ? Qtrue : Qfalse; }
 static VALUE sprite_mirror_set(VALUE s, VALUE v) { GET_SPRITE(s)->mirror = RTEST(v); return v; }
 
-static VALUE sprite_bitmap(VALUE s) { return GET_SPRITE(s)->bitmap; }
+static VALUE sprite_bitmap(VALUE s) {
+    if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite"); return GET_SPRITE(s)->bitmap; }
 static VALUE sprite_bitmap_set(VALUE s, VALUE v)
 {
+    if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite");
     SpriteVal *sp = GET_SPRITE(s);
     sp->bitmap = v;
     /* 原版语义: 设置 bitmap 时 src_rect 自动重置为整张图 */
@@ -721,9 +792,12 @@ static VALUE sprite_src_rect(VALUE s)
     }
     return sp->src_rect;
 }
-static VALUE sprite_src_rect_set(VALUE s, VALUE v) { GET_SPRITE(s)->src_rect = v; return v; }
-static VALUE sprite_viewport(VALUE s) { return GET_SPRITE(s)->viewport; }
-static VALUE sprite_viewport_set(VALUE s, VALUE v) { GET_SPRITE(s)->viewport = v; return v; }
+static VALUE sprite_src_rect_set(VALUE s, VALUE v) {
+    if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite"); GET_SPRITE(s)->src_rect = v; return v; }
+static VALUE sprite_viewport(VALUE s) {
+    if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite"); return GET_SPRITE(s)->viewport; }
+static VALUE sprite_viewport_set(VALUE s, VALUE v) {
+    if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite"); GET_SPRITE(s)->viewport = v; return v; }
 /* sprite 的 color/tone 也必须始终是对象: 脚本写 self.color.set(...) */
 static VALUE sprite_color(VALUE s)
 {
@@ -734,9 +808,11 @@ static VALUE sprite_color(VALUE s)
     }
     return sp->color;
 }
-static VALUE sprite_color_set(VALUE s, VALUE v) { GET_SPRITE(s)->color = v; return v; }
+static VALUE sprite_color_set(VALUE s, VALUE v) {
+    if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite"); GET_SPRITE(s)->color = v; return v; }
 static VALUE sprite_tone(VALUE s)
 {
+    if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite");
     SpriteVal *sp = GET_SPRITE(s);
     if (NIL_P(sp->tone)) {
         VALUE a[4] = { INT2FIX(0), INT2FIX(0), INT2FIX(0), INT2FIX(0) };
@@ -746,7 +822,8 @@ static VALUE sprite_tone(VALUE s)
 }
 static VALUE sprite_tone_set(VALUE s, VALUE v) { GET_SPRITE(s)->tone = v; return v; }
 static VALUE sprite_flash(VALUE s, VALUE c, VALUE d) { (void)s; (void)c; (void)d; return Qnil; }
-static VALUE sprite_update(VALUE s) { (void)s; return Qnil; }
+static VALUE sprite_update(VALUE s) {
+    if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite"); (void)s; return Qnil; }
 
 /* ================= Viewport ================= */
 typedef struct {
@@ -782,7 +859,8 @@ static VALUE vp_initialize(int argc, VALUE *argv, VALUE self)
 }
 
 static VALUE vp_rect(VALUE s) { return GET_VP(s)->rect; }
-static VALUE vp_rect_set(VALUE s, VALUE v) { GET_VP(s)->rect = v; return v; }
+static VALUE vp_rect_set(VALUE s, VALUE v) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); GET_VP(s)->rect = v; return v; }
 /* viewport 的 color/tone 同样必须始终是对象: 脚本写 @viewport.color.set(...) */
 static VALUE vp_color(VALUE s)
 {
@@ -793,9 +871,11 @@ static VALUE vp_color(VALUE s)
     }
     return v->color;
 }
-static VALUE vp_color_set(VALUE s, VALUE val) { GET_VP(s)->color = val; return val; }
+static VALUE vp_color_set(VALUE s, VALUE val) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); GET_VP(s)->color = val; return val; }
 static VALUE vp_tone(VALUE s)
 {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport");
     ViewportVal *v = GET_VP(s);
     if (NIL_P(v->tone)) {
         VALUE a[4] = { INT2FIX(0), INT2FIX(0), INT2FIX(0), INT2FIX(0) };
@@ -803,19 +883,30 @@ static VALUE vp_tone(VALUE s)
     }
     return v->tone;
 }
-static VALUE vp_tone_set(VALUE s, VALUE val) { GET_VP(s)->tone = val; return val; }
-static VALUE vp_ox(VALUE s) { return rb_float_new(GET_VP(s)->ox); }
-static VALUE vp_ox_set(VALUE s, VALUE v) { GET_VP(s)->ox = NUM2DBL(v); return v; }
-static VALUE vp_oy(VALUE s) { return rb_float_new(GET_VP(s)->oy); }
-static VALUE vp_oy_set(VALUE s, VALUE v) { GET_VP(s)->oy = NUM2DBL(v); return v; }
-static VALUE vp_z(VALUE s) { return rb_float_new(GET_VP(s)->z); }
-static VALUE vp_z_set(VALUE s, VALUE v) { GET_VP(s)->z = NUM2DBL(v); return v; }
-static VALUE vp_visible(VALUE s) { return GET_VP(s)->visible ? Qtrue : Qfalse; }
-static VALUE vp_visible_set(VALUE s, VALUE v) { GET_VP(s)->visible = RTEST(v); return v; }
+static VALUE vp_tone_set(VALUE s, VALUE val) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); GET_VP(s)->tone = val; return val; }
+static VALUE vp_ox(VALUE s) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); return rb_float_new(GET_VP(s)->ox); }
+static VALUE vp_ox_set(VALUE s, VALUE v) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); GET_VP(s)->ox = NUM2DBL(v); return v; }
+static VALUE vp_oy(VALUE s) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); return rb_float_new(GET_VP(s)->oy); }
+static VALUE vp_oy_set(VALUE s, VALUE v) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); GET_VP(s)->oy = NUM2DBL(v); return v; }
+static VALUE vp_z(VALUE s) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); return rb_float_new(GET_VP(s)->z); }
+static VALUE vp_z_set(VALUE s, VALUE v) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); GET_VP(s)->z = NUM2DBL(v); return v; }
+static VALUE vp_visible(VALUE s) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); return GET_VP(s)->visible ? Qtrue : Qfalse; }
+static VALUE vp_visible_set(VALUE s, VALUE v) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); GET_VP(s)->visible = RTEST(v); return v; }
 static VALUE vp_dispose(VALUE s) { GET_VP(s)->disposed = 1; return Qnil; }
 static VALUE vp_disposed_p(VALUE s) { return GET_VP(s)->disposed ? Qtrue : Qfalse; }
-static VALUE vp_flash(VALUE s, VALUE c, VALUE d) { (void)s; (void)c; (void)d; return Qnil; }
-static VALUE vp_update(VALUE s) { (void)s; return Qnil; }
+static VALUE vp_flash(VALUE s, VALUE c, VALUE d) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); (void)s; (void)c; (void)d; return Qnil; }
+static VALUE vp_update(VALUE s) {
+    if (GET_VP(s)->disposed) rgss_raise_disposed("disposed viewport"); (void)s; return Qnil; }
 
 /* ================= Plane ================= */
 typedef struct {
@@ -848,8 +939,8 @@ static VALUE plane_initialize(int argc, VALUE *argv, VALUE self)
     return self;
 }
 #define PLN_ACC(name, field, conv, rconv) \
-    static VALUE plane_##name(VALUE s) { return rconv(GET_PLANE(s)->field); } \
-    static VALUE plane_##name##_set(VALUE s, VALUE v) { GET_PLANE(s)->field = conv(v); return v; }
+    static VALUE plane_##name(VALUE s) { if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); return rconv(GET_PLANE(s)->field); } \
+    static VALUE plane_##name##_set(VALUE s, VALUE v) { if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); GET_PLANE(s)->field = conv(v); return v; }
 PLN_ACC(x, x, NUM2DBL, rb_float_new)
 PLN_ACC(y, y, NUM2DBL, rb_float_new)
 PLN_ACC(z, z, NUM2DBL, rb_float_new)
@@ -859,19 +950,29 @@ PLN_ACC(zoom_x, zoom_x, NUM2DBL, rb_float_new)
 PLN_ACC(zoom_y, zoom_y, NUM2DBL, rb_float_new)
 PLN_ACC(opacity, opacity, NUM2INT, INT2FIX)
 PLN_ACC(blend_type, blend_type, NUM2INT, INT2FIX)
-static VALUE plane_visible(VALUE s) { return GET_PLANE(s)->visible ? Qtrue : Qfalse; }
-static VALUE plane_visible_set(VALUE s, VALUE v) { GET_PLANE(s)->visible = RTEST(v); return v; }
-static VALUE plane_bitmap(VALUE s) { return GET_PLANE(s)->bitmap; }
-static VALUE plane_bitmap_set(VALUE s, VALUE v) { GET_PLANE(s)->bitmap = v; return v; }
-static VALUE plane_viewport(VALUE s) { return GET_PLANE(s)->viewport; }
-static VALUE plane_viewport_set(VALUE s, VALUE v) { GET_PLANE(s)->viewport = v; return v; }
+static VALUE plane_visible(VALUE s) {
+    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); return GET_PLANE(s)->visible ? Qtrue : Qfalse; }
+static VALUE plane_visible_set(VALUE s, VALUE v) {
+    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); GET_PLANE(s)->visible = RTEST(v); return v; }
+static VALUE plane_bitmap(VALUE s) {
+    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); return GET_PLANE(s)->bitmap; }
+static VALUE plane_bitmap_set(VALUE s, VALUE v) {
+    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); GET_PLANE(s)->bitmap = v; return v; }
+static VALUE plane_viewport(VALUE s) {
+    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); return GET_PLANE(s)->viewport; }
+static VALUE plane_viewport_set(VALUE s, VALUE v) {
+    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); GET_PLANE(s)->viewport = v; return v; }
 static VALUE plane_color(VALUE s) { return GET_PLANE(s)->color; }
-static VALUE plane_color_set(VALUE s, VALUE v) { GET_PLANE(s)->color = v; return v; }
-static VALUE plane_tone(VALUE s) { return GET_PLANE(s)->tone; }
-static VALUE plane_tone_set(VALUE s, VALUE v) { GET_PLANE(s)->tone = v; return v; }
+static VALUE plane_color_set(VALUE s, VALUE v) {
+    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); GET_PLANE(s)->color = v; return v; }
+static VALUE plane_tone(VALUE s) {
+    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); return GET_PLANE(s)->tone; }
+static VALUE plane_tone_set(VALUE s, VALUE v) {
+    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); GET_PLANE(s)->tone = v; return v; }
 static VALUE plane_dispose(VALUE s) { GET_PLANE(s)->disposed = 1; GET_PLANE(s)->visible = 0; return Qnil; }
 static VALUE plane_disposed_p(VALUE s) { return GET_PLANE(s)->disposed ? Qtrue : Qfalse; }
-static VALUE plane_update(VALUE s) { (void)s; return Qnil; }
+static VALUE plane_update(VALUE s) {
+    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); (void)s; return Qnil; }
 
 /* ================= Tilemap ================= */
 typedef struct {
@@ -903,8 +1004,8 @@ static VALUE tilemap_initialize(int argc, VALUE *argv, VALUE self)
     return self;
 }
 #define TMP_ACC(name, field, conv, rconv) \
-    static VALUE tilemap_##name(VALUE s) { return rconv(GET_TILEMAP(s)->field); } \
-    static VALUE tilemap_##name##_set(VALUE s, VALUE v) { GET_TILEMAP(s)->field = conv(v); return v; }
+    static VALUE tilemap_##name(VALUE s) { if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); return rconv(GET_TILEMAP(s)->field); } \
+    static VALUE tilemap_##name##_set(VALUE s, VALUE v) { if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); GET_TILEMAP(s)->field = conv(v); return v; }
 TMP_ACC(x, x, NUM2DBL, rb_float_new)
 TMP_ACC(y, y, NUM2DBL, rb_float_new)
 TMP_ACC(z, z, NUM2DBL, rb_float_new)
@@ -913,10 +1014,14 @@ TMP_ACC(oy, oy, NUM2DBL, rb_float_new)
 TMP_ACC(opacity, opacity, NUM2INT, INT2FIX)
 TMP_ACC(blend_type, blend_type, NUM2INT, INT2FIX)
 TMP_ACC(map_data, map_data, (VALUE), (VALUE))
-static VALUE tilemap_visible(VALUE s) { return GET_TILEMAP(s)->visible ? Qtrue : Qfalse; }
-static VALUE tilemap_visible_set(VALUE s, VALUE v) { GET_TILEMAP(s)->visible = RTEST(v); return v; }
-static VALUE tilemap_viewport(VALUE s) { return GET_TILEMAP(s)->viewport; }
-static VALUE tilemap_viewport_set(VALUE s, VALUE v) { GET_TILEMAP(s)->viewport = v; return v; }
+static VALUE tilemap_visible(VALUE s) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); return GET_TILEMAP(s)->visible ? Qtrue : Qfalse; }
+static VALUE tilemap_visible_set(VALUE s, VALUE v) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); GET_TILEMAP(s)->visible = RTEST(v); return v; }
+static VALUE tilemap_viewport(VALUE s) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); return GET_TILEMAP(s)->viewport; }
+static VALUE tilemap_viewport_set(VALUE s, VALUE v) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); GET_TILEMAP(s)->viewport = v; return v; }
 static VALUE tilemap_dispose(VALUE s)
 {
     TilemapVal *t = GET_TILEMAP(s);
@@ -931,6 +1036,7 @@ static VALUE tilemap_update(VALUE s) { (void)s; return Qnil; }
  * 原版是内建 9 元素数组, 索引越界会抛 IndexError; 这里同样用 Ruby Array。 */
 static VALUE tilemap_bitmaps(VALUE s)
 {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap");
     TilemapVal *t = GET_TILEMAP(s);
     if (NIL_P(t->bitmaps)) {
         /* 预填 9 个 nil, 让 bitmaps[n] = bmp 直接落在范围内 */
@@ -941,13 +1047,18 @@ static VALUE tilemap_bitmaps(VALUE s)
 }
 static VALUE tilemap_bitmaps_set(VALUE s, VALUE v)
 {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap");
     GET_TILEMAP(s)->bitmaps = v;
     return v;
 }
-static VALUE tilemap_passages(VALUE s) { return GET_TILEMAP(s)->passages; }
-static VALUE tilemap_passages_set(VALUE s, VALUE v) { GET_TILEMAP(s)->passages = v; return v; }
-static VALUE tilemap_flash_data(VALUE s) { return GET_TILEMAP(s)->flash_data; }
-static VALUE tilemap_flash_data_set(VALUE s, VALUE v) { GET_TILEMAP(s)->flash_data = v; return v; }
+static VALUE tilemap_passages(VALUE s) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); return GET_TILEMAP(s)->passages; }
+static VALUE tilemap_passages_set(VALUE s, VALUE v) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); GET_TILEMAP(s)->passages = v; return v; }
+static VALUE tilemap_flash_data(VALUE s) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); return GET_TILEMAP(s)->flash_data; }
+static VALUE tilemap_flash_data_set(VALUE s, VALUE v) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); GET_TILEMAP(s)->flash_data = v; return v; }
 
 /* ================= Window ================= */
 typedef struct {
@@ -1034,8 +1145,8 @@ static VALUE window_initialize(int argc, VALUE *argv, VALUE self)
     return self;
 }
 #define WIN_ACC(name, field, conv, rconv) \
-    static VALUE window_##name(VALUE s) { return rconv(GET_WIN(s)->field); } \
-    static VALUE window_##name##_set(VALUE s, VALUE v) { GET_WIN(s)->field = conv(v); return v; }
+    static VALUE window_##name(VALUE s) { if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); return rconv(GET_WIN(s)->field); } \
+    static VALUE window_##name##_set(VALUE s, VALUE v) { if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); GET_WIN(s)->field = conv(v); return v; }
 WIN_ACC(x, x, NUM2DBL, rb_float_new)
 WIN_ACC(y, y, NUM2DBL, rb_float_new)
 WIN_ACC(z, z, NUM2DBL, rb_float_new)
@@ -1051,10 +1162,12 @@ WIN_ACC(contents_opacity, contents_opacity, NUM2DBL, rb_float_new)
  * 若不钳制会一路加到 288 永远等不到 255, 展开动画死循环。 */
 static VALUE window_openness(VALUE s)
 {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window");
     return INT2FIX((int)GET_WIN(s)->openness);
 }
 static VALUE window_openness_set(VALUE s, VALUE v)
 {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window");
     int n = NUM2INT(v);
     if (n < 0)   n = 0;
     if (n > 255) n = 255;
@@ -1071,36 +1184,48 @@ static VALUE window_opacity_set(VALUE s, VALUE v)
     GET_WIN(s)->opacity = n;
     return INT2FIX(n);
 }
-static VALUE window_width(VALUE s) { return INT2FIX(GET_WIN(s)->width); }
+static VALUE window_width(VALUE s) {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); return INT2FIX(GET_WIN(s)->width); }
 static VALUE window_width_set(VALUE s, VALUE v)
 {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window");
     GET_WIN(s)->width = NUM2INT(v);
     FILE *f = RGSS_LOG_FOPEN("rgss_window.log");
     if (f) { fprintf(f, "[win] width=%d\n", GET_WIN(s)->width); fclose(f); }
     return v;
 }
-static VALUE window_height(VALUE s) { return INT2FIX(GET_WIN(s)->height); }
+static VALUE window_height(VALUE s) {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); return INT2FIX(GET_WIN(s)->height); }
 static VALUE window_height_set(VALUE s, VALUE v)
 {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window");
     GET_WIN(s)->height = NUM2INT(v);
     FILE *f = RGSS_LOG_FOPEN("rgss_window.log");
     if (f) { fprintf(f, "[win] height=%d\n", GET_WIN(s)->height); fclose(f); }
     return v;
 }
-static VALUE window_visible(VALUE s) { return GET_WIN(s)->visible ? Qtrue : Qfalse; }
-static VALUE window_visible_set(VALUE s, VALUE v) { GET_WIN(s)->visible = RTEST(v); return v; }
-static VALUE window_pause(VALUE s) { return GET_WIN(s)->pause ? Qtrue : Qfalse; }
-static VALUE window_pause_set(VALUE s, VALUE v) { GET_WIN(s)->pause = RTEST(v); return v; }
+static VALUE window_visible(VALUE s) {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); return GET_WIN(s)->visible ? Qtrue : Qfalse; }
+static VALUE window_visible_set(VALUE s, VALUE v) {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); GET_WIN(s)->visible = RTEST(v); return v; }
+static VALUE window_pause(VALUE s) {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); return GET_WIN(s)->pause ? Qtrue : Qfalse; }
+static VALUE window_pause_set(VALUE s, VALUE v) {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); GET_WIN(s)->pause = RTEST(v); return v; }
 static VALUE window_active(VALUE s) { return GET_WIN(s)->active ? Qtrue : Qfalse; }
 static VALUE window_active_set(VALUE s, VALUE v) { GET_WIN(s)->active = RTEST(v); return v; }
 static VALUE window_viewport(VALUE s) { return GET_WIN(s)->viewport; }
 static VALUE window_viewport_set(VALUE s, VALUE v) { GET_WIN(s)->viewport = v; return v; }
-static VALUE window_contents(VALUE s) { return GET_WIN(s)->contents; }
-static VALUE window_contents_set(VALUE s, VALUE v) { GET_WIN(s)->contents = v; return v; }
+static VALUE window_contents(VALUE s) {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); return GET_WIN(s)->contents; }
+static VALUE window_contents_set(VALUE s, VALUE v) {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); GET_WIN(s)->contents = v; return v; }
 static VALUE window_windowskin(VALUE s) { return GET_WIN(s)->windowskin; }
 static VALUE window_windowskin_set(VALUE s, VALUE v) { GET_WIN(s)->windowskin = v; return v; }
-static VALUE window_cursor_rect(VALUE s) { return GET_WIN(s)->cursor_rect; }
-static VALUE window_cursor_rect_set(VALUE s, VALUE v) { GET_WIN(s)->cursor_rect = v; return v; }
+static VALUE window_cursor_rect(VALUE s) {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); return GET_WIN(s)->cursor_rect; }
+static VALUE window_cursor_rect_set(VALUE s, VALUE v) {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); GET_WIN(s)->cursor_rect = v; return v; }
 /* dispose 后窗口脱离绘制列表 (对齐 Sprite.dispose 语义;
  * Scene_Menu#terminate 等场景销毁路径依赖它移除 @status_window) */
 static VALUE window_dispose(VALUE s)
@@ -1112,7 +1237,8 @@ static VALUE window_dispose(VALUE s)
     return Qnil;
 }
 static VALUE window_disposed_p(VALUE s) { return GET_WIN(s)->disposed ? Qtrue : Qfalse; }
-static VALUE window_update(VALUE s) { (void)s; return Qnil; }
+static VALUE window_update(VALUE s) {
+    if (GET_WIN(s)->disposed) rgss_raise_disposed("disposed window"); (void)s; return Qnil; }
 
 /* ================= 注册 ================= */
 void rgss_init_graphics(VALUE super)

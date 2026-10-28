@@ -202,6 +202,20 @@ static int run_scripts_pass(void)
             if (NIL_P(src) || TYPE(src) != T_STRING) continue;
 
             /* 运行标志 = 1 → eval(src) → = 0 (0x1000b2c1-0x1000b2f1) */
+#if RGSS_DEBUG_TOOLS
+            /* 调试钩: RGSS_TEST_EVAL → 每段前 eval (须幂等; 游戏入口主循环
+             * 所在段会永久阻塞, 之后注入不可达) */
+            {
+                const char *test_eval = getenv("RGSS_TEST_EVAL");
+                if (test_eval && test_eval[0]) {
+                    state = 0;
+                    g_script_running = 1;
+                    rb_eval_string_protect(test_eval, &state);
+                    g_script_running = 0;
+                    if (state) goto exception;
+                }
+            }
+#endif
             g_script_running = 1;                /* 原版 0x10173478 */
             rb_eval_string_protect(RSTRING(src)->ptr, &state);
             g_script_running = 0;
@@ -333,10 +347,12 @@ int __cdecl rgss_game_main(int a, int b, int c)
 #if RGSS_DEBUG_TOOLS
     /* B44: 启动即清理上一轮日志 (运行期不再累积) */
     rgss_debug_cleanup();
-    /* 崩溃转储通路自测: RGSS_DEBUG_CRASH_TEST=1 时启动即空指针自毁 */
+    /* 崩溃转储通路自测: 仅当 RGSS_DEBUG_CRASH_TEST 为非 0 值时自毁
+     * (设 "0" 也不触发, 否则无法显式关闭) */
     {
-        char v[4];
-        if (GetEnvironmentVariableA("RGSS_DEBUG_CRASH_TEST", v, sizeof v) > 0) {
+        char v[8];
+        if (GetEnvironmentVariableA("RGSS_DEBUG_CRASH_TEST", v, sizeof v) > 0 &&
+            v[0] != '0' && v[0] != '\0') {
             volatile int *p = (volatile int *)0;
             *p = 1;   /* 故意崩溃 → rgss_crash.log */
         }

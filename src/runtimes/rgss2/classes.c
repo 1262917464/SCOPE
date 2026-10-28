@@ -76,6 +76,17 @@ static void plog(const char *m)
     if (f) { fputs(m, f); fputc(10, f); fclose(f); }
 }
 
+/* B19: dispose 后访问器抛错 (原版各访问器内联检查引擎指针为空后
+ * rb_raise(缓存的 RGSLError→RGSSError 类, "disposed <class>")，消息字符串实证:
+ * 0x101048a8 sprite / 0x10103df0 bitmap / 0x1047b0 plane / 0x1049d8 tilemap /
+ * 0x104a70 viewport / 0x104a98 window) */
+void rgss_raise_disposed(const char *msg)
+{
+    static VALUE cErr;
+    if (!cErr) cErr = rb_define_class("RGSSError", rb_eStandardError);
+    rb_raise(cErr, "%s", msg);
+}
+
 void rgss_register_phase_b(void)
 {
     if (s_phase_b_done) return;

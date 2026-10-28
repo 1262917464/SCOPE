@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "ruby.h"
 #include "debug.h"
+void rgss_raise_disposed(const char *msg);
 
 typedef struct { int width, height; } PixelBuffer;
 typedef struct { PixelBuffer *buf; } BitmapImpl;
@@ -132,6 +133,7 @@ static VALUE bm_initialize(int argc, VALUE *argv, VALUE self)
 
 static VALUE bm_width(VALUE self)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     Bitmap *b = GET_BITMAP(self);
     if (!b->impl || !b->impl->buf) return INT2FIX(0);
     return INT2FIX(b->impl->buf->width);
@@ -139,6 +141,7 @@ static VALUE bm_width(VALUE self)
 
 static VALUE bm_height(VALUE self)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     Bitmap *b = GET_BITMAP(self);
     if (!b->impl || !b->impl->buf) return INT2FIX(0);
     return INT2FIX(b->impl->buf->height);
@@ -146,6 +149,7 @@ static VALUE bm_height(VALUE self)
 
 static VALUE bm_rect(VALUE self)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     VALUE a[4];
     a[0] = INT2FIX(0); a[1] = INT2FIX(0);
     a[2] = bm_width(self); a[3] = bm_height(self);
@@ -171,6 +175,7 @@ static VALUE bm_disposed_p(VALUE self)
 
 static VALUE bm_get_pixel(VALUE self, VALUE vx, VALUE vy)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     Bitmap *b = GET_BITMAP(self);
     int x = NUM2INT(vx), y = NUM2INT(vy);
     if (!b->impl || !b->impl->buf || !b->pixels)
@@ -183,6 +188,7 @@ static VALUE bm_get_pixel(VALUE self, VALUE vx, VALUE vy)
 
 static VALUE bm_set_pixel(VALUE self, VALUE vx, VALUE vy, VALUE vc)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     Bitmap *b = GET_BITMAP(self);
     int x = NUM2INT(vx), y = NUM2INT(vy);
     int r, g, bl, a;
@@ -199,6 +205,7 @@ static VALUE bm_set_pixel(VALUE self, VALUE vx, VALUE vy, VALUE vc)
 
 static VALUE bm_clear(VALUE self)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     Bitmap *b = GET_BITMAP(self);
     if (!b->pixels || !b->impl || !b->impl->buf) return Qnil;
     memset(b->pixels, 0, (size_t)b->stride * b->impl->buf->height);
@@ -207,6 +214,7 @@ static VALUE bm_clear(VALUE self)
 
 static VALUE bm_clear_rect(int argc, VALUE *argv, VALUE self)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     VALUE vr;
     rb_scan_args(argc, argv, "1", &vr);
     int rx = NUM2INT(rb_funcall(vr, rb_intern("x"), 0));
@@ -228,6 +236,7 @@ static VALUE bm_clear_rect(int argc, VALUE *argv, VALUE self)
 
 static VALUE bm_fill_rect(int argc, VALUE *argv, VALUE self)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     VALUE vx, vy, vw, vh, vc;
     rb_scan_args(argc, argv, "5", &vx, &vy, &vw, &vh, &vc);
     int rx = NUM2INT(vx), ry = NUM2INT(vy);
@@ -252,6 +261,7 @@ static VALUE bm_fill_rect(int argc, VALUE *argv, VALUE self)
 /* blt(dx, dy, src_bitmap, src_rect[, opacity]) */
 static VALUE bm_blt(int argc, VALUE *argv, VALUE self)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     VALUE vdx, vdy, vsrc, vsr, vop;
     rb_scan_args(argc, argv, "41", &vdx, &vdy, &vsrc, &vsr, &vop);
     int dx = NUM2INT(vdx), dy = NUM2INT(vdy);
@@ -292,6 +302,7 @@ static VALUE bm_blt(int argc, VALUE *argv, VALUE self)
 
 static VALUE bm_stretch_blt(int argc, VALUE *argv, VALUE self)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     VALUE vdr, vsrc, vsr, vop;
     rb_scan_args(argc, argv, "31", &vdr, &vsrc, &vsr, &vop);
     if (!rb_obj_is_kind_of(vsrc, cBitmap)) return Qnil;
@@ -523,6 +534,7 @@ static HFONT rgss_create_font_from_names(VALUE vname, int size, int bold, int it
 #if 0
 static VALUE bm_draw_text(int argc, VALUE *argv, VALUE self)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     VALUE vx, vy, vw, vh, vstr, valign;
     int x, y, w, h;
     /* 两种形式: draw_text(x,y,w,h,str[,align]) 或 draw_text(rect, str[,align]) */
@@ -715,6 +727,7 @@ static VALUE bm_draw_text(int argc, VALUE *argv, VALUE self)
 /* text_size(str) -> Rect(width, height) */
 static VALUE bm_text_size(VALUE self, VALUE vstr)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     StringValue(vstr);
     int fsize = 20, bold = 0, italic = 0;
     VALUE vfont = rb_iv_get(self, "@font");
@@ -1116,6 +1129,7 @@ static VALUE bm_text_size(VALUE self, VALUE vstr)
 
 static VALUE bm_font_get(VALUE self)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     VALUE f = rb_iv_get(self, "@font");
     if (NIL_P(f)) {
         /* 原版: 未设置时返回默认 Font 实例 */
@@ -1125,14 +1139,17 @@ static VALUE bm_font_get(VALUE self)
     }
     return f;
 }
-static VALUE bm_font_set(VALUE self, VALUE v) { rb_iv_set(self, "@font", v); return v; }
+static VALUE bm_font_set(VALUE self, VALUE v) {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap"); rb_iv_set(self, "@font", v); return v; }
 
-static VALUE bm_hue_change(VALUE self, VALUE vh) { (void)self; (void)vh; return Qnil; }
+static VALUE bm_hue_change(VALUE self, VALUE vh) {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap"); (void)self; (void)vh; return Qnil; }
 static VALUE bm_blur(VALUE self) { return Qnil; }
 static VALUE bm_radial_blur(VALUE self, VALUE va, VALUE vr) { (void)va; (void)vr; return Qnil; }
 
 static VALUE bm_gradient_fill_rect(int argc, VALUE *argv, VALUE self)
 {
+    if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     VALUE vx, vy, vw, vh, c1, c2, vertical;
     rb_scan_args(argc, argv, "61", &vx, &vy, &vw, &vh, &c1, &c2, &vertical);
     int rx = NUM2INT(vx), ry = NUM2INT(vy);

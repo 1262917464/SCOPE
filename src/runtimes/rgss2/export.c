@@ -118,7 +118,7 @@ __declspec(dllexport) const char * __cdecl RGSSGetStringUTF8(const char *code)
     static char buf[4096];
     int st = 0;
     VALUE v = get_str_value(code, &st);
-    if (st || !TYPE(v) == T_STRING) { buf[0] = 0; return buf; }
+    if (st || TYPE(v) != T_STRING) { buf[0] = 0; return buf; }
     lstrcpynA(buf, RSTRING(v)->ptr, sizeof buf);
     return buf;
 }
@@ -129,7 +129,7 @@ __declspec(dllexport) const char * __cdecl RGSSGetStringACP(const char *code)
     int st = 0;
     VALUE v = get_str_value(code, &st);
     buf[0] = 0;
-    if (st || !TYPE(v) == T_STRING) return buf;
+    if (st || TYPE(v) != T_STRING) return buf;
     MultiByteToWideChar(CP_UTF8, 0, RSTRING(v)->ptr, -1, (LPWSTR)buf, 0);
     return buf;
 }
@@ -140,7 +140,7 @@ __declspec(dllexport) const wchar_t * __cdecl RGSSGetStringUTF16(const char *cod
     int st = 0;
     VALUE v = get_str_value(code, &st);
     buf[0] = 0;
-    if (st || !TYPE(v) == T_STRING) return buf;
+    if (st || TYPE(v) != T_STRING) return buf;
     MultiByteToWideChar(CP_UTF8, 0, RSTRING(v)->ptr, -1, buf, 2048);
     return buf;
 }
