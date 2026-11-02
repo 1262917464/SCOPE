@@ -258,6 +258,66 @@ static VALUE bm_fill_rect(int argc, VALUE *argv, VALUE self)
     return Qnil;
 }
 
+/* ---------- blt / stretch_blt: 原版混合语义 (2026-10-29 黑盒对拍钉死) ----------
+ * 原版执行链: 0x10004ce0/0x10004e20 → 混合器 0x10096680 (mode 0x80000830)
+ *   → traits[0x101404b4+0x14] = 0x100a43e0 → 内循环 0x100a0600 (1:1) /
+ *   0x100a06d0 (缩放点采样); opacity 经 256x256B LUT (0x1019ca90) 折入源 alpha,
+ *   权重表 0x1018bb90[ea] = (ea+1,ea+1,ea+1,0)。
+ * Game.exe 实测语义 (tools/verify/bltcheck.c 对拍, local/test/bc_orig):
+ *   ea    = (srcA*op + 127) / 255            -- LUT[op][srcA], 四舍五入
+ *   out_a = ea + da*(255-ea)/255             -- straight-alpha over
+ *   out_c = (src_c*ea + dst_c*da*(255-ea)/255) / out_a
+ *   da=255 时精确等价移位形态 out = dst + sar((src-dst)*(ea+1), 8) (B/A 行逐位吻合)
+ *   da=0  时退化为 out = (src_rgb, ea) (C 行)
+ *   缩放采样 = 双轴 floor(x*sw/dw) 点采样 (E/E2/E3 行) */
+static int blt_sar8(int v)
+{
+    return v >> 8;   /* gcc x86: 算术移位 = floor, 与原版 sar 一致 */
+}
+
+/* 单像素合成。ea 已折算; ea==0 时原样返回 dst (权重表 0 号项全 0) */
+static uint32_t blt_compose(uint32_t d, uint32_t s, int ea)
+{
+    int da, da2, oa;
+    int sr, sg, sb, dr, dg, db, nr, ng, nb;
+    if (ea <= 0 && ((d >> 24) & 0xFF) != 0) return d;
+    da = (int)((d >> 24) & 0xFF);
+    if (da == 0) {
+        /* da=0: 原版退化为 (src_rgb, ea) — 即使 ea=0 也保留 src RGB (E 行) */
+        return (s & 0x00FFFFFF) | ((uint32_t)ea << 24);
+    }
+    da2 = da * (255 - ea) / 255;          /* dst 的贡献权重 */
+    oa = ea + da2;                        /* out alpha (D 行 6 点吻合) */
+    sr = s & 0xFF; sg = (s >> 8) & 0xFF; sb = (s >> 16) & 0xFF;
+    dr = d & 0xFF; dg = (d >> 8) & 0xFF; db = (d >> 16) & 0xFF;
+    if (da == 255) {
+        /* 原版移位形态 (A/B/P4 行逐位吻合) */
+        nr = dr + blt_sar8((sr - dr) * (ea + 1));
+        ng = dg + blt_sar8((sg - dg) * (ea + 1));
+        nb = db + blt_sar8((sb - db) * (ea + 1));
+    } else {
+        /* 归一化 straight-over (整数舍入按对拍微调) */
+        nr = (sr * ea + dr * da2) / oa;
+        ng = (sg * ea + dg * da2) / oa;
+        nb = (sb * ea + db * da2) / oa;
+    }
+    if (nr < 0) nr = 0; else if (nr > 255) nr = 255;
+    if (ng < 0) ng = 0; else if (ng > 255) ng = 255;
+    if (nb < 0) nb = 0; else if (nb > 255) nb = 255;
+    return ((uint32_t)oa << 24) | ((uint32_t)nb << 16) |
+           ((uint32_t)ng << 8) | (uint32_t)nr;
+}
+
+static int blt_arg_rect(VALUE v, int *x, int *y, int *w, int *h)
+{
+    if (!rb_obj_is_kind_of(v, cRect)) return 0;
+    *x = NUM2INT(rb_funcall(v, rb_intern("x"), 0));
+    *y = NUM2INT(rb_funcall(v, rb_intern("y"), 0));
+    *w = NUM2INT(rb_funcall(v, rb_intern("width"), 0));
+    *h = NUM2INT(rb_funcall(v, rb_intern("height"), 0));
+    return 1;
+}
+
 /* blt(dx, dy, src_bitmap, src_rect[, opacity]) */
 static VALUE bm_blt(int argc, VALUE *argv, VALUE self)
 {
@@ -266,17 +326,18 @@ static VALUE bm_blt(int argc, VALUE *argv, VALUE self)
     rb_scan_args(argc, argv, "41", &vdx, &vdy, &vsrc, &vsr, &vop);
     int dx = NUM2INT(vdx), dy = NUM2INT(vdy);
     int op = NIL_P(vop) ? 255 : NUM2INT(vop);
-    if (op <= 0) return Qnil;
-    if (!rb_obj_is_kind_of(vsrc, cBitmap)) return Qnil;
+    int sx, sy, sw, sh;
+    if (!rb_obj_is_kind_of(vsrc, cBitmap))
+        rb_raise(rb_eTypeError, "wrong argument type %s (expected Bitmap)",
+                 rb_class2name(rb_obj_class(vsrc)));
+    if (!blt_arg_rect(vsr, &sx, &sy, &sw, &sh))
+        rb_raise(rb_eTypeError, "wrong argument type %s (expected Rect)",
+                 rb_class2name(rb_obj_class(vsr)));
 
     Bitmap *dst = GET_BITMAP(self), *src = GET_BITMAP(vsrc);
     if (!dst->pixels || !dst->impl || !dst->impl->buf) return Qnil;
     if (!src->pixels || !src->impl || !src->impl->buf) return Qnil;
 
-    int sx = NUM2INT(rb_funcall(vsr, rb_intern("x"), 0));
-    int sy = NUM2INT(rb_funcall(vsr, rb_intern("y"), 0));
-    int sw = NUM2INT(rb_funcall(vsr, rb_intern("width"), 0));
-    int sh = NUM2INT(rb_funcall(vsr, rb_intern("height"), 0));
     int DW = dst->impl->buf->width, DH = dst->impl->buf->height;
     int SW = src->impl->buf->width, SH = src->impl->buf->height;
     int dstride = dst->stride >> 2, sstride = src->stride >> 2;
@@ -288,13 +349,8 @@ static VALUE bm_blt(int argc, VALUE *argv, VALUE self)
             int tx = dx + x, sx2 = sx + x;
             if (tx < 0 || tx >= DW || sx2 < 0 || sx2 >= SW) continue;
             uint32_t sp = src->pixels[sstride * sy2 + sx2];
-            if (op < 255) {
-                /* 简单按 opacity 缩放 alpha */
-                uint32_t sa = (sp >> 24) & 0xFF;
-                sa = sa * op / 255;
-                sp = (sp & 0x00FFFFFF) | (sa << 24);
-            }
-            dst->pixels[dstride * ty + tx] = sp;
+            int ea = ((int)((sp >> 24) & 0xFF) * op + 127) / 255;
+            dst->pixels[dstride * ty + tx] = blt_compose(dst->pixels[dstride * ty + tx], sp, ea);
         }
     }
     return Qnil;
@@ -305,16 +361,17 @@ static VALUE bm_stretch_blt(int argc, VALUE *argv, VALUE self)
     if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
     VALUE vdr, vsrc, vsr, vop;
     rb_scan_args(argc, argv, "31", &vdr, &vsrc, &vsr, &vop);
-    if (!rb_obj_is_kind_of(vsrc, cBitmap)) return Qnil;
-    int dx = NUM2INT(rb_funcall(vdr, rb_intern("x"), 0));
-    int dy = NUM2INT(rb_funcall(vdr, rb_intern("y"), 0));
-    int dw = NUM2INT(rb_funcall(vdr, rb_intern("width"), 0));
-    int dh = NUM2INT(rb_funcall(vdr, rb_intern("height"), 0));
-    int sx = NUM2INT(rb_funcall(vsr, rb_intern("x"), 0));
-    int sy = NUM2INT(rb_funcall(vsr, rb_intern("y"), 0));
-    int sw = NUM2INT(rb_funcall(vsr, rb_intern("width"), 0));
-    int sh = NUM2INT(rb_funcall(vsr, rb_intern("height"), 0));
-    (void)vop;
+    if (!rb_obj_is_kind_of(vsrc, cBitmap))
+        rb_raise(rb_eTypeError, "wrong argument type %s (expected Bitmap)",
+                 rb_class2name(rb_obj_class(vsrc)));
+    int op = NIL_P(vop) ? 255 : NUM2INT(vop);
+    int dx, dy, dw, dh, sx, sy, sw, sh;
+    if (!blt_arg_rect(vdr, &dx, &dy, &dw, &dh))
+        rb_raise(rb_eTypeError, "wrong argument type %s (expected Rect)",
+                 rb_class2name(rb_obj_class(vdr)));
+    if (!blt_arg_rect(vsr, &sx, &sy, &sw, &sh))
+        rb_raise(rb_eTypeError, "wrong argument type %s (expected Rect)",
+                 rb_class2name(rb_obj_class(vsr)));
     if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return Qnil;
 
     Bitmap *dst = GET_BITMAP(self), *src = GET_BITMAP(vsrc);
@@ -324,17 +381,23 @@ static VALUE bm_stretch_blt(int argc, VALUE *argv, VALUE self)
     int SW = src->impl->buf->width, SH = src->impl->buf->height;
     int dstride = dst->stride >> 2, sstride = src->stride >> 2;
 
+    /* 原版 0x100a06d0: 32.32 定点累加器, 步长截断 (sw<<32)/dw, pos 从 0 起
+     * 每输出像素推进一次 —— 步长截断使精确命中点 (如 8->6 的 x=3) 取 idx-1 */
+    uint64_t xstep = ((uint64_t)sw << 32) / (unsigned)dw;
+    uint64_t ystep = ((uint64_t)sh << 32) / (unsigned)dh;
     for (int y = 0; y < dh; y++) {
         int ty = dy + y;
-        if (ty < 0 || ty >= DH) continue;
-        int sy2 = sy + y * sh / dh;
-        if (sy2 < 0 || sy2 >= SH) continue;
+        int sy2 = sy + (int)(ystep * (unsigned)y >> 32);
+        if (ty < 0 || ty >= DH || sy2 < 0 || sy2 >= SH) continue;
+        uint64_t xpos = 0;
         for (int x = 0; x < dw; x++) {
             int tx = dx + x;
-            if (tx < 0 || tx >= DW) continue;
-            int sx2 = sx + x * sw / dw;
-            if (sx2 < 0 || sx2 >= SW) continue;
-            dst->pixels[dstride * ty + tx] = src->pixels[sstride * sy2 + sx2];
+            int sx2 = sx + (int)(xpos >> 32);
+            xpos += xstep;
+            if (tx < 0 || tx >= DW || sx2 < 0 || sx2 >= SW) continue;
+            uint32_t sp = src->pixels[sstride * sy2 + sx2];
+            int ea = ((int)((sp >> 24) & 0xFF) * op + 127) / 255;
+            dst->pixels[dstride * ty + tx] = blt_compose(dst->pixels[dstride * ty + tx], sp, ea);
         }
     }
     return Qnil;

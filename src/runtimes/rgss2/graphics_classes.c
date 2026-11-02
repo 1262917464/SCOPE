@@ -1742,7 +1742,57 @@ static void draw_wall_shadow(int dx, int dy, VALUE vb, int wall_id, int anim)
 /* 角部暗块 (0x10017920, 需 A3/A4 墙) 未实装 — 本游戏地图无 A3/A4, 路径不可达;
  * 0x100171a0 谓词保留解码记录: id∈0x610-0x7FF 或 autotile_castable(id)。 */
 
-static void draw_tilemap_layer(TilemapVal *t, VALUE vdata, int layer, int ox, int oy)
+/* passages bit 0x10 = VX 图块管理器 ☆ 标记 (M5-p §1.2; 实测空块 id0 与 59 个
+ * B-E/A5 块置位, 自动块无)。passages 未设时按"仅 id0 置位"处理。 */
+static int tile_star_flag(TilemapVal *t, int id)
+{
+    if (id == 0) return 1;
+    if (NIL_P(t->passages)) return 0;
+    VALUE v = rb_funcall(t->passages, rb_intern("[]"), 1, INT2FIX(id));
+    return NIL_P(v) ? 0 : (NUM2INT(v) & 0x10);
+}
+
+/* flash_data 逐格闪烁 (M5-p §2; 0x10017BEA + 0x10096920 mode2 + 0x100a3d00/
+ * 0x100a3c10 MMX 核): f>0 时对该 32x32 格原地混合
+ *   t_c = 饱和255(src_c + k*nib_c)   nib: B=bit0-3, G=bit4-7, R=bit8-11
+ *   out_c = src_c + (t_c-src_c)*F[w] >> 8,  F[x]=x+1, w=视口裁剪后宽度
+ * k = ((anim>>2)&7) 三角波 +4 → 4..8 (与水面动画共用计数器, 32 帧周期)。
+ * 色对象实测: mode=2, alpha=0, mul=128×3, add=(c3,c2,c1,0)。 */
+static void draw_tile_flash(int dx, int dy, int f, int anim)
+{
+    int ph = (anim >> 2) & 7;
+    int k = (ph >= 4 ? 8 - ph : ph) + 4;
+    int addB = k * (f & 0xF);
+    int addG = k * ((f >> 4) & 0xF);
+    int addR = k * ((f >> 8) & 0xF);
+    int rw = rgss_render_width(), rh = rgss_render_height();
+    int x1 = dx < 0 ? 0 : dx, y1 = dy < 0 ? 0 : dy;
+    int x2 = dx + 32 > rw ? rw : dx + 32;
+    int y2 = dy + 32 > rh ? rh : dy + 32;
+    if (x2 - x1 <= 0 || y2 - y1 <= 0) return;      /* 0x10095c20 空裁剪 */
+    int F = (x2 - x1) + 1;
+    uint32_t *bits = (uint32_t *)rgss_render_get_bits();
+    for (int y = y1; y < y2; y++) {
+        uint32_t *row = bits + (size_t)y * rw;
+        for (int x = x1; x < x2; x++) {
+            uint32_t p = row[x];
+            int b = p & 255, g = (p >> 8) & 255, r = (p >> 16) & 255;
+            int tb = b + addB > 255 ? 255 : b + addB;
+            int tg = g + addG > 255 ? 255 : g + addG;
+            int tr = r + addR > 255 ? 255 : r + addR;
+            int ob = b + ((tb - b) * F >> 8);
+            int og = g + ((tg - g) * F >> 8);
+            int orr = r + ((tr - r) * F >> 8);
+            row[x] = 0xFF000000u | ((uint32_t)orr << 16) | ((uint32_t)og << 8) | (uint32_t)ob;
+        }
+    }
+}
+
+/* star=0: 原版 obj0 普通遍 (layer 0..2, 跳过 ☆ 块);
+ * star=1: 原版 obj1 ☆ 遍 (仅 layer 2, 只画 ☆ 块; 调用方负责在精灵之后调)。
+ * flash_data 检查按原版位于 3 层循环之后每格执行 (0x10017BEA), 两遍皆走。 */
+static void draw_tilemap_layer(TilemapVal *t, VALUE vdata, int layer, int ox, int oy,
+                               int star)
 {
     int W = NUM2INT(rb_funcall(vdata, rb_intern("xsize"), 0));
     int H = NUM2INT(rb_funcall(vdata, rb_intern("ysize"), 0));
@@ -1761,17 +1811,22 @@ static void draw_tilemap_layer(TilemapVal *t, VALUE vdata, int layer, int ox, in
             if (x < 0 || x >= W) continue;
             int id = NUM2INT(rb_funcall(vdata, rb_intern("[]"), 3,
                                         INT2FIX(x), INT2FIX(y), INT2FIX(layer)));
-            if (id == 0) continue;
+            int flag = tile_star_flag(t, id);
+            if (star) {
+                if (layer != 2 || !flag || id == 0) continue;
+            } else {
+                if (flag) continue;
+            }
             int dx = x * 32 - ox, dy = y * 32 - oy;
             if (id >= 0x800) {
                 if (id <= 0x800 + 96 * 48) draw_autotile(dx, dy, vb, id, t->anim);
             } else {
                 draw_plain_tile(dx, dy, vb, id);
             }
-            /* 阴影: 仅 layer 0 (原版 0x10017aef test ebp,ebp/jg 跳过);
+            /* 阴影: 仅普通遍 layer 0 (原版 0x10017aef test ebp,ebp/jg 跳过);
              * 0x10017b57: 当前格是 A3/A4 (0x1100-0x1FFF) 或环绕 kind 时跳过;
              * 其余格若上方为墙则投影条。 */
-            if (layer == 0 && y > 0) {
+            if (!star && layer == 0 && y > 0) {
                 int skip = (id >= 0x1100 && id <= 0x1FFF) ||
                            ((id >= 0xB00 && id <= 0x10FF) && !autotile_castable(id));
                 if (!skip) {
@@ -1779,6 +1834,15 @@ static void draw_tilemap_layer(TilemapVal *t, VALUE vdata, int layer, int ox, in
                                                 INT2FIX(x), INT2FIX(y - 1), INT2FIX(layer)));
                     if (autotile_castable(up))
                         draw_wall_shadow(dx, dy, vb, up, t->anim);
+                }
+            }
+            /* flash_data (原版 0x10017BEA): f = (int16)flash[W*y+x], f>0 才闪 */
+            if (!NIL_P(t->flash_data)) {
+                VALUE vf = rb_funcall(t->flash_data, rb_intern("[]"), 2,
+                                      INT2FIX(x), INT2FIX(y));
+                if (!NIL_P(vf)) {
+                    int f = NUM2INT(vf);
+                    if (f > 0) draw_tile_flash(dx, dy, f, t->anim);
                 }
             }
         }
@@ -1957,13 +2021,17 @@ void rgss_engine_reset_registries(void)
 void rgss_compose_scene(void)
 {
     if (!rgss_render_get_bits()) return;
-    /* 地图层先画 (位于精灵之下) */
+    /* 普通遍 (原版 obj0, mode 0): layer 0..2 的非☆块, 位于精灵之下 */
     for (int ti = 0; ti < g_tilemap_count; ti++) {
         TilemapVal *tm = (TilemapVal *)g_tilemaps[ti];
         if (!tm || tm->disposed || !tm->visible) continue;
         int tox = (int)tm->ox, toy = (int)tm->oy;
-        for (int layer = 0; layer < 2; layer++)
-            draw_tilemap_layer(tm, tm->map_data, layer, tox, toy);
+        for (int layer = 0; layer < 3; layer++)
+            draw_tilemap_layer(tm, tm->map_data, layer, tox, toy, 0);
+        /* ☆ 遍 (原版 obj1, mode 1): layer 2 的 ☆ 块, 紧随普通遍、仍在精灵之前。
+         * 运行期实测 (Frida 钩 0x10017970/0x10014ae0): 帧内顺序 = mode0 →
+         * mode1 → 精灵 (同一 z 有序成员数组遍历 0x10098fb5, 同 z 按注册序)。 */
+        draw_tilemap_layer(tm, tm->map_data, 2, tox, toy, 1);
     }
     sort_sprites();
     for (int i = 0; i < g_sprite_count; i++) {
