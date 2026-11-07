@@ -41,7 +41,7 @@
 
 ## M5-h 剩余（原 §八）
 
-1. 自动图块 48 形状表（见上 §未决 5，反汇编原版 Tilemap 绘制函数取 48 形状 → 2x3 块 6 片精确映射）。
+1. ~~自动图块 48 形状表~~（M5-o/M5-p 已完成：三表实装 + 双遍 ☆ + flash_data，见差异清单 B45b）。
 2. 音频：MCI（winmm）BGM/ME + SE。
 4. ~~帧率限制~~（QueryPerformanceCounter 已完成）；~~draw_text 自绘~~（M5-j 已完成）。
 

@@ -87,3 +87,18 @@
    要么自己验证到证据级，要么在清单里标注"转引自 X，未验证"。
    反例：差异清单 B48 曾基于 M5-k §4.2 登记"防盗版校验"，实际不存在（见
    `docs/analysis/rgss2/差异清单.md` §三-A）。
+
+## 缺陷 50（2026-11-07）：Frida 同会话多脚本仅第一个脚本的钩子生效
+现象：同一 Frida 会话中先加载脚本 A（钩子生效），再加载脚本 B/C（attach 不报错、
+计数器永远为 0）。跨 4 个会话复现。对策：**所有钩子必须合入会话的第一个脚本**；
+需要新钩子时重开游戏会话（kill + 重启 + 重附）。另：本机 Frida 为旧 API——
+`Module.getExportByName`/`Module.findExportByName`/`Interceptor.returnAddress` 不存在，
+须用 `Process.findModuleByName().enumerateExports()` 与 `this.returnAddress`；
+`GetAsyncKeyState` 在 USER32 不在 KERNEL32。原版 RMVX 输入不走 user32 键 API
+（gaks/gks/gksx 全 0，应为 DirectInput），伪造按键需另辟路径。
+## 缺陷 51（2026-11-07）：对拍相机必须先解算再归因
+教训：屏幕→地图坐标换算若用错 oy（如 544 vs 416），会把动画水面误判为
+静态图块差异，并派生出成串的假异常（"shape 28 特例路径"、"引擎改写地图"等）。
+对策：对拍前先用**非周期性图案**（如草地 T 形边缘、孤立块）做模板匹配解算
+ox/oy，并检查次优解得分比（93.75% vs 43% 才算无歧义）；周期纹理（砖墙）
+匹配会产生 ±周期 的混叠假匹配。

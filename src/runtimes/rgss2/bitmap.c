@@ -275,37 +275,36 @@ static int blt_sar8(int v)
     return v >> 8;   /* gcc x86: 算术移位 = floor, 与原版 sar 一致 */
 }
 
-/* 单像素合成。ea 已折算; ea==0 时原样返回 dst (权重表 0 号项全 0) */
+/* 单像素合成 — 2026-11-07 最终形态: 照抄原版 0x100a93f0 生成循环的查表语义
+ * ( Frida dump 生成代码 codegen_A_da255.bin 逐指令反汇编确证 ):
+ *   ea    = LUT_op[srcA]                     (调用方已算好)
+ *   wi    = T1[(dstA<<8)|ea]                 @0x1018ca90, 64K 权重索引表
+ *   out_a = T2[(dstA<<8)|ea]                 @0x101aca90, 64K alpha 表
+ *   W     = W8[wi] = (wi+1, wi+1, wi+1, 0)   @0x1018bb90
+ *   out_c = dst_c + sar8((src_c-dst_c) * W)  —— psubw/pmullw/psrlw(逻辑)/paddb
+ *                                              字节回绕链, C 的 >> 即等价
+ * da=0 特例 (C 行实测): 输出 (src_rgb, ea) —— 对应 src 全 alpha 覆盖 */
+#include "blt_tables.h"
+
 static uint32_t blt_compose(uint32_t d, uint32_t s, int ea)
 {
-    int da, da2, oa;
-    int sr, sg, sb, dr, dg, db, nr, ng, nb;
-    if (ea <= 0 && ((d >> 24) & 0xFF) != 0) return d;
-    da = (int)((d >> 24) & 0xFF);
-    if (da == 0) {
-        /* da=0: 原版退化为 (src_rgb, ea) — 即使 ea=0 也保留 src RGB (E 行) */
+    int da = (int)((d >> 24) & 0xFF);
+    int wi, w, sr, sg, sb, dr, dg, db, nr, ng, nb;
+    if (da == 0)
         return (s & 0x00FFFFFF) | ((uint32_t)ea << 24);
-    }
-    da2 = da * (255 - ea) / 255;          /* dst 的贡献权重 */
-    oa = ea + da2;                        /* out alpha (D 行 6 点吻合) */
-    sr = s & 0xFF; sg = (s >> 8) & 0xFF; sb = (s >> 16) & 0xFF;
-    dr = d & 0xFF; dg = (d >> 8) & 0xFF; db = (d >> 16) & 0xFF;
-    if (da == 255) {
-        /* 原版移位形态 (A/B/P4 行逐位吻合) */
-        nr = dr + blt_sar8((sr - dr) * (ea + 1));
-        ng = dg + blt_sar8((sg - dg) * (ea + 1));
-        nb = db + blt_sar8((sb - db) * (ea + 1));
-    } else {
-        /* 归一化 straight-over (整数舍入按对拍微调) */
-        nr = (sr * ea + dr * da2) / oa;
-        ng = (sg * ea + dg * da2) / oa;
-        nb = (sb * ea + db * da2) / oa;
-    }
+    wi = g_blt_t1[(da << 8) | ea];
+    w = (wi == 0) ? 0 : wi + 1;   /* W8[0] = (0,0,0,0) 特殊项, 其余 = wi+1 */
+    sr = (s >> 16) & 0xFF; sg = (s >> 8) & 0xFF; sb = s & 0xFF;
+    dr = (d >> 16) & 0xFF; dg = (d >> 8) & 0xFF; db = d & 0xFF;
+    /* 注意字节序: 像素 dword = (A<<24)|(R<<16)|(G<<8)|B, lane0=B, lane2=R */
+    nr = dr + blt_sar8((sr - dr) * w);
+    ng = dg + blt_sar8((sg - dg) * w);
+    nb = db + blt_sar8((sb - db) * w);
     if (nr < 0) nr = 0; else if (nr > 255) nr = 255;
     if (ng < 0) ng = 0; else if (ng > 255) ng = 255;
     if (nb < 0) nb = 0; else if (nb > 255) nb = 255;
-    return ((uint32_t)oa << 24) | ((uint32_t)nb << 16) |
-           ((uint32_t)ng << 8) | (uint32_t)nr;
+    return ((uint32_t)g_blt_t2[(da << 8) | ea] << 24) |
+           ((uint32_t)nr << 16) | ((uint32_t)ng << 8) | (uint32_t)nb;
 }
 
 static int blt_arg_rect(VALUE v, int *x, int *y, int *w, int *h)
