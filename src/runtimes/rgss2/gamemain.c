@@ -124,23 +124,50 @@ static void rgss_cleanup_pass(void)
         "Audio.bgm_stop;Audio.bgs_stop;GC.start;", &st);
 }
 
-/* ---------- 错误弹窗 (原版 sub_1000A080) ---------- */
+/* ---------- 错误弹窗 (原版 sub_1000A080) ----------
+ * 增强: 完整调用链 + 现场状态 ($scene/帧计数/对象类), 并落盘 rgss_error.log */
 static void show_script_error(void)
 {
     VALUE err = rb_gv_get("$!");
-    char buf[2048];
+    char buf[8192];
+    char state[1024];
+    state[0] = 0;
     if (NIL_P(err)) {
         lstrcpynA(buf, "Unknown error ($! is nil)", (int)sizeof buf);
     } else {
         int st = 0;
+        /* 完整调用链 (不再截 8 帧); 再收集 $scene/帧计数等现场状态 */
         VALUE bt = rb_eval_string_protect(
-            "$!.backtrace ? $!.backtrace[0,8].join(\"\\n\") : ''", &st);
+            "($!.backtrace || []).join(\"\\n\")", &st);
+        int sst = 0;
+        VALUE sc = rb_eval_string_protect(
+            "$scene ? $scene.class.name : 'nil'", &sst);
+        VALUE fc = rb_eval_string_protect("Graphics.frame_count", &sst);
+        _snprintf(state, sizeof state - 1, "\n[scene=%s frame=%d]",
+                  (!sst && !NIL_P(sc)) ? StringValueCStr(sc) : "?",
+                  (!sst) ? NUM2INT(fc) : -1);
+        state[sizeof state - 1] = 0;
         VALUE msg = rb_funcall(err, rb_intern("message"), 0);
-        _snprintf(buf, sizeof buf - 1, "%s: %s%s%.700s",
+        _snprintf(buf, sizeof buf - 1, "%s: %s%s%.3000s%s",
                   rb_obj_classname(err), StringValueCStr(msg),
-                  (!st && !NIL_P(bt) && RSTRING(bt)->len) ? "\n" : "",
-                  (!st && !NIL_P(bt)) ? StringValueCStr(bt) : "");
+                  (!st && !NIL_P(bt) && RSTRING(bt)->len) ? "\n--- backtrace ---\n" : "",
+                  (!st && !NIL_P(bt)) ? StringValueCStr(bt) : "",
+                  state);
         buf[sizeof buf - 1] = 0;
+        /* 落盘 (完整, 不截断) */
+        {
+            FILE *f = fopen("rgss_error.log", "ab");
+            if (f) {
+                SYSTEMTIME t;
+                GetLocalTime(&t);
+                fprintf(f, "==== %04d-%02d-%02d %02d:%02d:%02d ====\n",
+                        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+                fprintf(f, "%s: %s\n", rb_obj_classname(err), StringValueCStr(msg));
+                if (!st && !NIL_P(bt)) fprintf(f, "%s\n", StringValueCStr(bt));
+                fprintf(f, "%s\n\n", state);
+                fclose(f);
+            }
+        }
     }
     MessageBoxA(g_hwnd, buf, "RGSS Error", MB_ICONWARNING);
 }

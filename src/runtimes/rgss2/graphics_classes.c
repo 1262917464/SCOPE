@@ -404,6 +404,10 @@ static VALUE gfx_resize_screen(VALUE m, VALUE vw, VALUE vh)
     g_screen_h = NUM2INT(vh);
     return Qnil;
 }
+/* RGSS2 新增: Graphics.width/height (画面宽高, 与内部 g_screen_w/h 同源;
+ * 依据: 羊驼历险记脚本在原版 RGSS202E 下调用无错) */
+static VALUE gfx_width(VALUE m)  { (void)m; return INT2NUM(g_screen_w); }
+static VALUE gfx_height(VALUE m) { (void)m; return INT2NUM(g_screen_h); }
 /* 小工具: 往日志文件追加一行 (变参), 返回是否成功。
  * 受 RGSS_DEBUG_TOOLS 门控 (debug.h): 关闭时恒不写。 */
 static int f_open_log(const char *path, const char *fmt, ...)
@@ -794,6 +798,28 @@ static VALUE sprite_src_rect(VALUE s)
 }
 static VALUE sprite_src_rect_set(VALUE s, VALUE v) {
     if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite"); GET_SPRITE(s)->src_rect = v; return v; }
+/* 原版 Sprite#width/height (0x1000cd10/0x1000cd70):
+ * src_rect ? src_rect.w/h : (bitmap ? bitmap.w/h : 0); zoom/x/y/viewport 均不影响(原版实测)。 */
+static VALUE sprite_width(VALUE s)
+{
+    SpriteVal *sp = GET_SPRITE(s);
+    if (sp->disposed) rgss_raise_disposed("disposed sprite");
+    if (!NIL_P(sp->src_rect))
+        return rb_funcall(sp->src_rect, rb_intern("width"), 0);
+    if (!NIL_P(sp->bitmap))
+        return rb_funcall(sp->bitmap, rb_intern("width"), 0);
+    return INT2FIX(0);
+}
+static VALUE sprite_height(VALUE s)
+{
+    SpriteVal *sp = GET_SPRITE(s);
+    if (sp->disposed) rgss_raise_disposed("disposed sprite");
+    if (!NIL_P(sp->src_rect))
+        return rb_funcall(sp->src_rect, rb_intern("height"), 0);
+    if (!NIL_P(sp->bitmap))
+        return rb_funcall(sp->bitmap, rb_intern("height"), 0);
+    return INT2FIX(0);
+}
 static VALUE sprite_viewport(VALUE s) {
     if (GET_SPRITE(s)->disposed) rgss_raise_disposed("disposed sprite"); return GET_SPRITE(s)->viewport; }
 static VALUE sprite_viewport_set(VALUE s, VALUE v) {
@@ -911,7 +937,7 @@ static VALUE vp_update(VALUE s) {
 /* ================= Plane ================= */
 typedef struct {
     VALUE viewport, bitmap, color, tone;
-    double x, y, z, ox, oy, zoom_x, zoom_y;
+    double z, ox, oy, zoom_x, zoom_y;
     int visible, opacity, blend_type;
     int disposed;
 } PlaneVal;
@@ -941,8 +967,6 @@ static VALUE plane_initialize(int argc, VALUE *argv, VALUE self)
 #define PLN_ACC(name, field, conv, rconv) \
     static VALUE plane_##name(VALUE s) { if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); return rconv(GET_PLANE(s)->field); } \
     static VALUE plane_##name##_set(VALUE s, VALUE v) { if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); GET_PLANE(s)->field = conv(v); return v; }
-PLN_ACC(x, x, NUM2DBL, rb_float_new)
-PLN_ACC(y, y, NUM2DBL, rb_float_new)
 PLN_ACC(z, z, NUM2DBL, rb_float_new)
 PLN_ACC(ox, ox, NUM2DBL, rb_float_new)
 PLN_ACC(oy, oy, NUM2DBL, rb_float_new)
@@ -958,10 +982,9 @@ static VALUE plane_bitmap(VALUE s) {
     if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); return GET_PLANE(s)->bitmap; }
 static VALUE plane_bitmap_set(VALUE s, VALUE v) {
     if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); GET_PLANE(s)->bitmap = v; return v; }
-static VALUE plane_viewport(VALUE s) {
-    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); return GET_PLANE(s)->viewport; }
 static VALUE plane_viewport_set(VALUE s, VALUE v) {
     if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); GET_PLANE(s)->viewport = v; return v; }
+/* 原版把 setter 以名 "viewport" 注册(argc=1)并同名覆盖 getter —— 见注册处注释 */
 static VALUE plane_color(VALUE s) { return GET_PLANE(s)->color; }
 static VALUE plane_color_set(VALUE s, VALUE v) {
     if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); GET_PLANE(s)->color = v; return v; }
@@ -971,14 +994,12 @@ static VALUE plane_tone_set(VALUE s, VALUE v) {
     if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); GET_PLANE(s)->tone = v; return v; }
 static VALUE plane_dispose(VALUE s) { GET_PLANE(s)->disposed = 1; GET_PLANE(s)->visible = 0; return Qnil; }
 static VALUE plane_disposed_p(VALUE s) { return GET_PLANE(s)->disposed ? Qtrue : Qfalse; }
-static VALUE plane_update(VALUE s) {
-    if (GET_PLANE(s)->disposed) rgss_raise_disposed("disposed plane"); (void)s; return Qnil; }
 
 /* ================= Tilemap ================= */
 typedef struct {
     VALUE viewport, map_data, flash_data, passages, bitmaps;
-    double x, y, z, ox, oy;
-    int visible, opacity, blend_type;
+    int ox, oy;   /* int, getter Fixnum (jmp 0x1001d850) */
+    int visible;
     int disposed;
     int anim;   /* 原版 C++ +0x10070 动画计数器 (0x10016d50: update 时 +1) */
 } TilemapVal;
@@ -997,7 +1018,7 @@ static VALUE tilemap_initialize(int argc, VALUE *argv, VALUE self)
 {
     VALUE vp; rb_scan_args(argc, argv, "01", &vp);
     TilemapVal *t = GET_TILEMAP(self);
-    t->viewport = vp; t->visible = 1; t->opacity = 255;
+    t->viewport = vp; t->visible = 1;
     /* calloc 给的 0 是 Qfalse 而非 Qnil, 必须显式初始化所有 VALUE 字段 */
     t->map_data = Qnil; t->flash_data = Qnil;
     t->passages = Qnil; t->bitmaps = Qnil;
@@ -1007,14 +1028,29 @@ static VALUE tilemap_initialize(int argc, VALUE *argv, VALUE self)
 #define TMP_ACC(name, field, conv, rconv) \
     static VALUE tilemap_##name(VALUE s) { if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); return rconv(GET_TILEMAP(s)->field); } \
     static VALUE tilemap_##name##_set(VALUE s, VALUE v) { if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); GET_TILEMAP(s)->field = conv(v); return v; }
-TMP_ACC(x, x, NUM2DBL, rb_float_new)
-TMP_ACC(y, y, NUM2DBL, rb_float_new)
-TMP_ACC(z, z, NUM2DBL, rb_float_new)
-TMP_ACC(ox, ox, NUM2DBL, rb_float_new)
-TMP_ACC(oy, oy, NUM2DBL, rb_float_new)
-TMP_ACC(opacity, opacity, NUM2INT, INT2FIX)
-TMP_ACC(blend_type, blend_type, NUM2INT, INT2FIX)
+/* B31: no x/y/z/opacity/blend_type in original (method table 0x1000fb90) */
+static VALUE tilemap_ox(VALUE s) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); return INT2FIX(GET_TILEMAP(s)->ox); }
+static VALUE tilemap_ox_set(VALUE s, VALUE v) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); GET_TILEMAP(s)->ox = NUM2INT(v); return v; }
+static VALUE tilemap_oy(VALUE s) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); return INT2FIX(GET_TILEMAP(s)->oy); }
+static VALUE tilemap_oy_set(VALUE s, VALUE v) {
+    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); GET_TILEMAP(s)->oy = NUM2INT(v); return v; }
 TMP_ACC(map_data, map_data, (VALUE), (VALUE))
+/* 原版五类 drawable 共享的 clone/dup 抛错实现 (0x10008fb0/0x10008fd0):
+ * rb_raise(TypeError, "can't clone %s"/"can't dup %s", 类名)。
+ * Tilemap/Sprite/Plane/Window/Viewport 五类均注册; Bitmap 等不注册(走 Ruby 默认, 原版实测 OK)。 */
+static VALUE rgss_obj_clone(VALUE self)
+{
+    rb_raise(rb_eTypeError, "can't clone %s", rb_class2name(rb_obj_class(self)));
+    return Qnil;
+}
+static VALUE rgss_obj_dup(VALUE self)
+{
+    rb_raise(rb_eTypeError, "can't dup %s", rb_class2name(rb_obj_class(self)));
+    return Qnil;
+}
 static VALUE tilemap_visible(VALUE s) {
     if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); return GET_TILEMAP(s)->visible ? Qtrue : Qfalse; }
 static VALUE tilemap_visible_set(VALUE s, VALUE v) {
@@ -1031,27 +1067,73 @@ static VALUE tilemap_dispose(VALUE s)
     return Qnil;
 }
 static VALUE tilemap_disposed_p(VALUE s) { return GET_TILEMAP(s)->disposed ? Qtrue : Qfalse; }
-static VALUE tilemap_update(VALUE s) { GET_TILEMAP(s)->anim++; return Qnil; }
+static VALUE tilemap_update(VALUE s)
+{
+    TilemapVal *t = GET_TILEMAP(s);
+    t->anim++;
+    /* 原版 update 调用链内做 ox/oy 归一化 (0x10016c5a-0x10016cdd: floor-mod
+     * W*32/H*32 后存绘制用 ox [+0x10068])，负值 floor 到非负 —— 绘制起点恒
+     * 非负。重建此前 update 仅 anim++，负 ox 走向零截断会画错起始格（账本
+     * "ox/oy 截断 vs floor" 存疑项由此关闭）。 */
+    if (!NIL_P(t->map_data)) {
+        int w = NUM2INT(rb_funcall(t->map_data, rb_intern("xsize"), 0)) * 32;
+        int h = NUM2INT(rb_funcall(t->map_data, rb_intern("ysize"), 0)) * 32;
+        if (w > 0) { int m = t->ox % w; if (m < 0) m += w; t->ox = m; }
+        if (h > 0) { int m = t->oy % h; if (m < 0) m += h; t->oy = m; }
+    }
+    return Qnil;
+}
 
-/* bitmaps: 9 张图块素材 (TileA1..A5, TileB..E), 脚本按索引写入。
- * 原版是内建 9 元素数组, 索引越界会抛 IndexError; 这里同样用 Ruby Array。 */
+/* bitmaps: 原版为 Tilemap::BitmapArray (0x1000fd8a const_set) —— 9 元素,
+ * [] 越界返 nil, []= 越界静默丢弃 (0x1000f340/0x1000f3f0 逐指令), 元素存 @bmp0..@bmp8。 */
+static VALUE cBitmapArray;   /* Tilemap::BitmapArray (B51) */
+
+static VALUE bitmaparray_alloc(VALUE k)
+{
+    /* 内部是真 Ruby Array (9 nil), GC 自动 mark; [] / []= 转发 + 越界语义 */
+    VALUE obj = Data_Wrap_Struct(k, 0, 0, (void *)1);
+    VALUE arr = rb_ary_new3(9, Qnil, Qnil, Qnil, Qnil, Qnil,
+                            Qnil, Qnil, Qnil, Qnil);
+    rb_iv_set(obj, "@arr", arr);
+    return obj;
+}
+
+static VALUE bitmaparray_get(VALUE self, VALUE idx)
+{
+    int i = NUM2INT(idx);
+    VALUE arr = rb_iv_get(self, "@arr");
+    if (i < 0 || i > 8) return Qnil;          /* 原版: 越界返 nil */
+    return rb_ary_entry(arr, i);
+}
+
+static VALUE bitmaparray_set(VALUE self, VALUE idx, VALUE v)
+{
+    int i = NUM2INT(idx);
+    VALUE arr = rb_iv_get(self, "@arr");
+    if (i < 0 || i > 8) return Qnil;          /* 原版: 越界静默丢弃 */
+    rb_ary_store(arr, i, v);
+    return v;
+}
+
+/* 绘制侧统一取元: BitmapArray 或普通 Array 皆可。
+ * (审查修正 2026-11-10: 原 Array 分支误写成自递归 → 栈溢出, 应为 rb_ary_entry) */
+static VALUE tilemap_bm_entry(VALUE vb, int idx)
+{
+    if (!NIL_P(vb) && rb_obj_is_kind_of(vb, cBitmapArray))
+        return bitmaparray_get(vb, INT2FIX(idx));
+    if (!NIL_P(vb) && TYPE(vb) == T_ARRAY) return rb_ary_entry(vb, idx);
+    return Qnil;
+}
+
 static VALUE tilemap_bitmaps(VALUE s)
 {
     if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap");
     TilemapVal *t = GET_TILEMAP(s);
-    if (NIL_P(t->bitmaps)) {
-        /* 预填 9 个 nil, 让 bitmaps[n] = bmp 直接落在范围内 */
-        t->bitmaps = rb_ary_new3(9, Qnil, Qnil, Qnil, Qnil, Qnil,
-                                 Qnil, Qnil, Qnil, Qnil);
-    }
+    if (NIL_P(t->bitmaps))
+        t->bitmaps = rb_class_new_instance(0, NULL, cBitmapArray);
     return t->bitmaps;
 }
-static VALUE tilemap_bitmaps_set(VALUE s, VALUE v)
-{
-    if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap");
-    GET_TILEMAP(s)->bitmaps = v;
-    return v;
-}
+/* 原版 Tilemap 无 bitmaps= (方法表实证) */
 static VALUE tilemap_passages(VALUE s) {
     if (GET_TILEMAP(s)->disposed) rgss_raise_disposed("disposed tilemap"); return GET_TILEMAP(s)->passages; }
 static VALUE tilemap_passages_set(VALUE s, VALUE v) {
@@ -1064,7 +1146,7 @@ static VALUE tilemap_flash_data_set(VALUE s, VALUE v) {
 /* ================= Window ================= */
 typedef struct {
     VALUE viewport, windowskin, contents, cursor_rect;
-    double x, y, z, ox, oy, zoom_x, zoom_y, openness, back_opacity, contents_opacity;
+    double x, y, z, ox, oy, openness, back_opacity, contents_opacity;
     int visible, pause, active;
     int disposed;
     int width, height, opacity;
@@ -1129,7 +1211,6 @@ static VALUE window_initialize(int argc, VALUE *argv, VALUE self)
     w->back_opacity = 192;
     w->opacity = 255;
     w->contents_opacity = 255;
-    w->zoom_x = w->zoom_y = 1.0;
     w->width  = NIL_P(vw) ? 0 : NUM2INT(vw);
     w->height = NIL_P(vh) ? 0 : NUM2INT(vh);
     /* contents 是 Bitmap */
@@ -1153,8 +1234,6 @@ WIN_ACC(y, y, NUM2DBL, rb_float_new)
 WIN_ACC(z, z, NUM2DBL, rb_float_new)
 WIN_ACC(ox, ox, NUM2DBL, rb_float_new)
 WIN_ACC(oy, oy, NUM2DBL, rb_float_new)
-WIN_ACC(zoom_x, zoom_x, NUM2DBL, rb_float_new)
-WIN_ACC(zoom_y, zoom_y, NUM2DBL, rb_float_new)
 WIN_ACC(back_opacity, back_opacity, NUM2DBL, rb_float_new)
 WIN_ACC(contents_opacity, contents_opacity, NUM2DBL, rb_float_new)
 
@@ -1261,6 +1340,8 @@ void rgss_init_graphics(VALUE super)
     rb_define_module_function(mGraphics, "fadein", gfx_fadein, 1);
     rb_define_module_function(mGraphics, "snap_to_bitmap", gfx_snap_to_bitmap, 0);
     rb_define_module_function(mGraphics, "resize_screen", gfx_resize_screen, 2);
+    rb_define_module_function(mGraphics, "width", gfx_width, 0);
+    rb_define_module_function(mGraphics, "height", gfx_height, 0);
     rb_define_module_function(mGraphics, "_reset", gfx_reset, 0);
 }
 
@@ -1369,6 +1450,10 @@ void rgss_init_sprite(VALUE super)
     rb_define_method(cSprite, "color=", sprite_color_set, 1);
     rb_define_method(cSprite, "tone", sprite_tone, 0);
     rb_define_method(cSprite, "tone=", sprite_tone_set, 1);
+    rb_define_method(cSprite, "width", sprite_width, 0);
+    rb_define_method(cSprite, "height", sprite_height, 0);
+    rb_define_method(cSprite, "clone", rgss_obj_clone, 0);
+    rb_define_method(cSprite, "dup", rgss_obj_dup, 0);
 }
 
 void rgss_init_viewport(VALUE super)
@@ -1392,8 +1477,10 @@ void rgss_init_viewport(VALUE super)
     rb_define_method(cViewport, "visible=", vp_visible_set, 1);
     rb_define_method(cViewport, "flash", vp_flash, 2);
     rb_define_method(cViewport, "dispose", vp_dispose, 0);
-    rb_define_method(cViewport, "disposed?", vp_disposed_p, 0);
+    /* 原版 Viewport 无 disposed? (0x620b420 方法表实证) */
     rb_define_method(cViewport, "update", vp_update, 0);
+    rb_define_method(cViewport, "clone", rgss_obj_clone, 0);
+    rb_define_method(cViewport, "dup", rgss_obj_dup, 0);
 }
 
 void rgss_init_plane(VALUE super)
@@ -1401,10 +1488,7 @@ void rgss_init_plane(VALUE super)
     cPlane = rb_define_class("Plane", super);
     rb_define_alloc_func(cPlane, plane_alloc);
     rb_define_method(cPlane, "initialize", plane_initialize, -1);
-    rb_define_method(cPlane, "x", plane_x, 0);
-    rb_define_method(cPlane, "x=", plane_x_set, 1);
-    rb_define_method(cPlane, "y", plane_y, 0);
-    rb_define_method(cPlane, "y=", plane_y_set, 1);
+    /* 原版 Plane 无 x/y/update (方法表实证), 不注册 */
     rb_define_method(cPlane, "z", plane_z, 0);
     rb_define_method(cPlane, "z=", plane_z_set, 1);
     rb_define_method(cPlane, "ox", plane_ox, 0);
@@ -1423,42 +1507,43 @@ void rgss_init_plane(VALUE super)
     rb_define_method(cPlane, "visible=", plane_visible_set, 1);
     rb_define_method(cPlane, "bitmap", plane_bitmap, 0);
     rb_define_method(cPlane, "bitmap=", plane_bitmap_set, 1);
-    rb_define_method(cPlane, "viewport", plane_viewport, 0);
-    rb_define_method(cPlane, "viewport=", plane_viewport_set, 1);
+    rb_define_method(cPlane, "viewport", plane_viewport_set, 1);
+    /* 原版 Plane 注册怪癖 (frida 方法表 0x620a040 实证): "viewport" 注册了两次,
+     * 第二次以 setter 实现(argc=1)同名覆盖 —— 最终 Plane#viewport 要求 1 参
+     * (viewport → ArgumentError 0 for 1; viewport(nil) → OK(nil))，且无 "viewport="。
+     * update/x/y 原版不存在, 不注册。 */
     rb_define_method(cPlane, "color", plane_color, 0);
     rb_define_method(cPlane, "color=", plane_color_set, 1);
     rb_define_method(cPlane, "tone", plane_tone, 0);
     rb_define_method(cPlane, "tone=", plane_tone_set, 1);
     rb_define_method(cPlane, "dispose", plane_dispose, 0);
     rb_define_method(cPlane, "disposed?", plane_disposed_p, 0);
-    rb_define_method(cPlane, "update", plane_update, 0);
+    rb_define_method(cPlane, "clone", rgss_obj_clone, 0);
+    rb_define_method(cPlane, "dup", rgss_obj_dup, 0);
 }
 
 void rgss_init_tilemap(VALUE super)
 {
     cTilemap = rb_define_class("Tilemap", super);
     rb_define_alloc_func(cTilemap, tilemap_alloc);
+    /* B51: Tilemap::BitmapArray (原版 0x1000fd8a const_set) */
+    cBitmapArray = rb_define_class_under(cTilemap, "BitmapArray", rb_cObject);
+    rb_define_alloc_func(cBitmapArray, bitmaparray_alloc);
+    rb_define_method(cBitmapArray, "[]", bitmaparray_get, 1);
+    rb_define_method(cBitmapArray, "[]=", bitmaparray_set, 2);
     rb_define_method(cTilemap, "initialize", tilemap_initialize, -1);
-    rb_define_method(cTilemap, "x", tilemap_x, 0);
-    rb_define_method(cTilemap, "x=", tilemap_x_set, 1);
-    rb_define_method(cTilemap, "y", tilemap_y, 0);
-    rb_define_method(cTilemap, "y=", tilemap_y_set, 1);
-    rb_define_method(cTilemap, "z", tilemap_z, 0);
-    rb_define_method(cTilemap, "z=", tilemap_z_set, 1);
+    rb_define_method(cTilemap, "clone", rgss_obj_clone, 0);
+    rb_define_method(cTilemap, "dup", rgss_obj_dup, 0);
     rb_define_method(cTilemap, "ox", tilemap_ox, 0);
     rb_define_method(cTilemap, "ox=", tilemap_ox_set, 1);
     rb_define_method(cTilemap, "oy", tilemap_oy, 0);
     rb_define_method(cTilemap, "oy=", tilemap_oy_set, 1);
-    rb_define_method(cTilemap, "opacity", tilemap_opacity, 0);
-    rb_define_method(cTilemap, "opacity=", tilemap_opacity_set, 1);
-    rb_define_method(cTilemap, "blend_type", tilemap_blend_type, 0);
-    rb_define_method(cTilemap, "blend_type=", tilemap_blend_type_set, 1);
     rb_define_method(cTilemap, "map_data", tilemap_map_data, 0);
     rb_define_method(cTilemap, "map_data=", tilemap_map_data_set, 1);
     rb_define_method(cTilemap, "visible", tilemap_visible, 0);
     rb_define_method(cTilemap, "visible=", tilemap_visible_set, 1);
     rb_define_method(cTilemap, "bitmaps", tilemap_bitmaps, 0);
-    rb_define_method(cTilemap, "bitmaps=", tilemap_bitmaps_set, 1);
+    /* 原版 Tilemap 无 bitmaps= (方法表实证), 不注册 */
     rb_define_method(cTilemap, "passages", tilemap_passages, 0);
     rb_define_method(cTilemap, "passages=", tilemap_passages_set, 1);
     rb_define_method(cTilemap, "flash_data", tilemap_flash_data, 0);
@@ -1485,10 +1570,7 @@ void rgss_init_window(VALUE super)
     rb_define_method(cWindow, "ox=", window_ox_set, 1);
     rb_define_method(cWindow, "oy", window_oy, 0);
     rb_define_method(cWindow, "oy=", window_oy_set, 1);
-    rb_define_method(cWindow, "zoom_x", window_zoom_x, 0);
-    rb_define_method(cWindow, "zoom_x=", window_zoom_x_set, 1);
-    rb_define_method(cWindow, "zoom_y", window_zoom_y, 0);
-    rb_define_method(cWindow, "zoom_y=", window_zoom_y_set, 1);
+    /* 原版 Window 无 zoom_x/zoom_y (方法表 0x6209a70 实证), 不注册 */
     rb_define_method(cWindow, "opacity", window_opacity, 0);
     rb_define_method(cWindow, "opacity=", window_opacity_set, 1);
     rb_define_method(cWindow, "openness", window_openness, 0);
@@ -1518,6 +1600,8 @@ void rgss_init_window(VALUE super)
     rb_define_method(cWindow, "dispose", window_dispose, 0);
     rb_define_method(cWindow, "disposed?", window_disposed_p, 0);
     rb_define_method(cWindow, "update", window_update, 0);
+    rb_define_method(cWindow, "clone", rgss_obj_clone, 0);
+    rb_define_method(cWindow, "dup", rgss_obj_dup, 0);
 }
 
 VALUE rgss_graphics_module(void) { return mGraphics; }
@@ -1690,7 +1774,7 @@ static void draw_autotile(int dx, int dy, VALUE vb, int id, int anim)
     int bmp_idx, xb, yb;
     const unsigned char *tab;
     autotile_geometry(kind, anim, &bmp_idx, &xb, &yb, &tab);
-    VALUE vsheet = rb_ary_entry(vb, bmp_idx);
+    VALUE vsheet = tilemap_bm_entry(vb, bmp_idx);
     if (NIL_P(vsheet)) return;
     int wrap7 = (bmp_idx == 1) && ((kind & 7) == 7);   /* 0x100176ee: A2 k%8==7 */
 
@@ -1711,7 +1795,7 @@ static void draw_autotile(int dx, int dy, VALUE vb, int id, int anim)
 static void draw_plain_tile(int dx, int dy, VALUE vb, int id)
 {
     int idx = (id >= 0x600) ? 4 : (id >> 8) + 5;
-    VALUE vsheet = rb_ary_entry(vb, idx);
+    VALUE vsheet = tilemap_bm_entry(vb, idx);
     if (NIL_P(vsheet)) return;
     int x = ((id % 8) + ((id >> 7) & 1) * 8) * 32;
     int y = (((id % 256) >> 3) % 16) * 32;
@@ -1730,7 +1814,7 @@ static void draw_wall_shadow(int dx, int dy, VALUE vb, int wall_id, int anim)
     autotile_geometry(wkind, anim, &bmp_idx, &wxb, &wyb, &tab);
     if (tab != autotile_T0) return;           /* 原版只查 T0 */
     if (tab[wshape * 8 + 5] != 5) return;
-    VALUE vsheet = rb_ary_entry(vb, bmp_idx);
+    VALUE vsheet = tilemap_bm_entry(vb, bmp_idx);
     if (NIL_P(vsheet)) return;
     for (int i = 0; i < 2; i++) {
         int qx = tab[wshape * 8 + 4 + i * 2], qy = tab[wshape * 8 + 5 + i * 2];
@@ -1819,7 +1903,10 @@ static void draw_tilemap_layer(TilemapVal *t, VALUE vdata, int layer, int ox, in
             }
             int dx = x * 32 - ox, dy = y * 32 - oy;
             if (id >= 0x800) {
-                if (id <= 0x800 + 96 * 48) draw_autotile(dx, dy, vb, id, t->anim);
+                /* 原版 0x10017365: cmp esi,0x800 / jge —— 无上界检查,
+                 * A4 高段 kind 96..127 (id 0x1A00-0x1FFF) 同样走 autotile。
+                 * (审查修正 2026-11-10: 删除多余的 0x800+96*48 截断) */
+                draw_autotile(dx, dy, vb, id, t->anim);
             } else {
                 draw_plain_tile(dx, dy, vb, id);
             }
@@ -2025,6 +2112,9 @@ void rgss_compose_scene(void)
     for (int ti = 0; ti < g_tilemap_count; ti++) {
         TilemapVal *tm = (TilemapVal *)g_tilemaps[ti];
         if (!tm || tm->disposed || !tm->visible) continue;
+        /* map_data 未设时跳过 (原版引擎侧 table 指针为空的等价防御;
+         * 若不跳过, xsize 会向 nil 发消息 → 异常逃出合成帧) */
+        if (NIL_P(tm->map_data)) continue;
         int tox = (int)tm->ox, toy = (int)tm->oy;
         for (int layer = 0; layer < 3; layer++)
             draw_tilemap_layer(tm, tm->map_data, layer, tox, toy, 0);
