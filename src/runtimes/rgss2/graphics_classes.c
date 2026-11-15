@@ -1208,7 +1208,9 @@ static VALUE window_initialize(int argc, VALUE *argv, VALUE self)
     w->visible = 1;
     w->active = 1;   /* calloc 给 0=false, 而 cursor_movable? 要求 active 为真 */
     w->openness = 255;
-    w->back_opacity = 192;
+    /* 原版引擎默认 255 (对拍实测裸 Window bopa=255); 192 是 Ruby 层
+     * Window_Base#initialize 的覆盖值, 不属于引擎默认 */
+    w->back_opacity = 255;
     w->opacity = 255;
     w->contents_opacity = 255;
     w->width  = NIL_P(vw) ? 0 : NUM2INT(vw);
@@ -1911,12 +1913,12 @@ static void draw_tilemap_layer(TilemapVal *t, VALUE vdata, int layer, int ox, in
                 draw_plain_tile(dx, dy, vb, id);
             }
             /* 阴影: 仅普通遍 layer 0 (原版 0x10017aef test ebp,ebp/jg 跳过);
-             * 0x10017b57: 当前格是 A3/A4 (0x1100-0x1FFF) 或环绕 kind 时跳过;
-             * 其余格若上方为墙则投影条。 */
+             * 0x10017b57 受影格 = A2/A3 (0xB00-0x10FF) 且 kind%8!=7 —— 允许名单
+             * (M5-o §7.1)。旧实装误写为"排除 A3/A4/环绕"的跳过名单, 使 A1 水格
+             * 也受影: Project3 沙带 (3377) 下缘水格顶部 8px 被画上 TileA2 阴影,
+             * 原版实证此处为纯水图形 (2026-11-15 B52 复活线, burst 相位对齐判据)。 */
             if (!star && layer == 0 && y > 0) {
-                int skip = (id >= 0x1100 && id <= 0x1FFF) ||
-                           ((id >= 0xB00 && id <= 0x10FF) && !autotile_castable(id));
-                if (!skip) {
+                if (autotile_castable(id)) {
                     int up = NUM2INT(rb_funcall(vdata, rb_intern("[]"), 3,
                                                 INT2FIX(x), INT2FIX(y - 1), INT2FIX(layer)));
                     if (autotile_castable(up))
@@ -2186,8 +2188,15 @@ void rgss_compose_scene(void)
 
         /* 2) contents（窗口内绘制的 Bitmap）
          *    Window_Base#create_contents 用 (width-32, height-32),
-         *    故原版把它画在窗口内 (+16,+16) 处, 并随 ox/oy 滚动 */
-        if (!NIL_P(w->contents)) {
+         *    故原版把它画在窗口内 (+16,+16) 处, 并随 ox/oy 滚动。
+         *    openness 语义 (2026-11-15 对拍实测): 原版仅在 openness==255
+         *    时绘制 contents; 一旦进入 open/close 动画 (openness<255),
+         *    contents 整体不画, 皮肤带照常垂直压缩。若不设闸门, 文字
+         *    原地渐隐/压缩残留, 表现为"窗口消失后文字还在"。
+         *    (受控实验: 注入脚本 fc300 建窗 fc800 起 openness -4/帧,
+         *    原版 openness 轨迹 251→219→…→27 逐帧与重建一致, 但关闭
+         *    中段原版带内无任何文字像素。) */
+        if (!NIL_P(w->contents) && (int)w->openness >= 255) {
             SrcSurface c;
             if (bitmap_surface(w->contents, &c)) {
                 int cw = c.w, ch = c.h;
@@ -2196,7 +2205,7 @@ void rgss_compose_scene(void)
                 if (cw > 0 && ch > 0)
                     rgss_render_blit(&c, wx + 16 - (int)w->ox, wy + 16 - (int)w->oy,
                                      0, 0, cw, ch, cw, ch,
-                                     (int)(w->contents_opacity * w->openness / 255), 3);
+                                     (int)w->contents_opacity, 3);
             }
         }
     }

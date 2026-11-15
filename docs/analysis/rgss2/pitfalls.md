@@ -102,3 +102,16 @@
 对策：对拍前先用**非周期性图案**（如草地 T 形边缘、孤立块）做模板匹配解算
 ox/oy，并检查次优解得分比（93.75% vs 43% 才算无歧义）；周期纹理（砖墙）
 匹配会产生 ±周期 的混叠假匹配。
+## 缺陷 52（2026-11-14）：Scripts.rvdata 注入段必须插在 Main 段之前
+RMVX 的 Main 段在 eval 内部跑主循环（$scene.main 不返回），**Main 之后的段
+永不执行**。把注入补丁 append 到 Scripts.rvdata 末尾 → 补丁静默不生效（无报错）。
+对策：定位 name == 'Main' 的元素字节偏移，在其前插入并 bump 数组计数。
+另：Marshal 转储的脚本 id 是带 'i'(0x69) 类型标记的 Integer 对象（69 + w_long），
+不能写成裸 w_long；数组计数/串长用无标记 w_long（0=0x00, 1..4=字节数前缀,
+5..0x7f=字节-5）。注入工具：local/build/yatuo_patch_scripts.py。
+
+## 缺陷 53（2026-11-14）：GDI+ 图片路径必须按 UTF-8 转宽字符
+load_image_gdiplus 原用 CP_ACP 转换 Ruby 传来的路径字节——汉字文件名在
+ACP=936 机器上变乱码 → 加载失败（表现为精灵缺失、静默降级 1x1 空图，
+仅 [BM] load=0 可见）。原版同机加载 CJK 文件名成功 ⇒ 原版按 UTF-8 转换。
+对策：image.cpp 用 CP_UTF8。诊断信号：控制台 [BM] load=0 0x0。

@@ -93,6 +93,10 @@ int main(int argc, char **argv)
     Sleep(6000);
     tap_key(VK_RETURN);          /* 进图，与 difftest 同时刻 */
     Sleep(3000);                  /* 转场彻底结束后再开始连拍 */
+    /* 走进测试簇: LEFT x6, DOWN x2 */
+    for (i = 0; i < 6; i++) { tap_key(VK_LEFT); Sleep(250); }
+    for (i = 0; i < 2; i++) { tap_key(VK_DOWN); Sleep(250); }
+    Sleep(1000);
     for (i = 0; i < 16; i++) {
         char nm[64];
         sprintf(nm, "b%02d.bmp", i);

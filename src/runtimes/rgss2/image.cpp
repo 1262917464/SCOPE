@@ -29,7 +29,9 @@ extern "C" int rgss_load_image(const char *path, unsigned int **out_bits,
     for (int i = 0; exts[i]; i++) {
         char full[MAX_PATH * 2];
         snprintf(full, sizeof full, "%s%s", path, exts[i]);
-        MultiByteToWideChar(CP_ACP, 0, full, -1, wpath, MAX_PATH * 2);
+        /* 路径为 Ruby $KCODE='u' 的 UTF-8 字节 (汉化工程脚本是 UTF-8; 原版
+         * 同机加载 CJK 文件名成功 ⇒ 原版按 UTF-8 转换, 非本机 ACP=936) */
+        MultiByteToWideChar(CP_UTF8, 0, full, -1, wpath, MAX_PATH * 2);
         bmp = Bitmap::FromFile(wpath);
         if (bmp && bmp->GetLastStatus() == Ok) break;
         if (bmp) { delete bmp; bmp = NULL; }

@@ -352,6 +352,23 @@ static LONG WINAPI rgss_crash_filter(EXCEPTION_POINTERS *ep)
         }
         fprintf(f, "\n");
     }
+    {   /* EBP 链回溯 (16 帧), 每帧标注 DLL 偏移 */
+        DWORD base = (DWORD)(DWORD_PTR)GetModuleHandleA("RGSS202E.dll");
+        DWORD *fp = (DWORD *)(DWORD_PTR)c->Ebp;
+        fprintf(f, "  backtrace:");
+        for (int i = 0; i < 16; i++) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(fp, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) break;
+            if (mbi.State != MEM_COMMIT) break;
+            DWORD ret = fp[1];
+            fprintf(f, " %08lX%s", ret,
+                    (ret >= base && ret < base + 0x800000)
+                        ? "" : "(ext)");
+            if (ret < base || ret >= base + 0x800000) break;
+            fp = (DWORD *)fp[0];
+        }
+        fprintf(f, "\n");
+    }
     dump_modules(f, ip);
     fclose(f);
     return EXCEPTION_CONTINUE_SEARCH;

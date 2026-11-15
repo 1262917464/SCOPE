@@ -1212,10 +1212,26 @@ static VALUE bm_radial_blur(VALUE self, VALUE va, VALUE vr) { (void)va; (void)vr
 static VALUE bm_gradient_fill_rect(int argc, VALUE *argv, VALUE self)
 {
     if (GET_BITMAP(self)->disposed) rgss_raise_disposed("disposed bitmap");
-    VALUE vx, vy, vw, vh, c1, c2, vertical;
-    rb_scan_args(argc, argv, "61", &vx, &vy, &vw, &vh, &c1, &c2, &vertical);
-    int rx = NUM2INT(vx), ry = NUM2INT(vy);
-    int rw = NUM2INT(vw), rh = NUM2INT(vh);
+    /* VX API 双形式: (x,y,w,h,c1,c2,vertical=false) / (rect,c1,c2,vertical=false)
+     * (羊驼历险记脚本两种都用; 原版 RGSS202E 允许) */
+    VALUE c1, c2, vertical;
+    int rx, ry, rw, rh;
+    if (argc >= 2 && rb_obj_is_kind_of(argv[0], rgss_rect_class())) {
+        if (argc < 3 || argc > 4)
+            rb_raise(rb_eArgError, "wrong number of arguments (%d for 3..4)", argc);
+        VALUE vr = argv[0];
+        c1 = argv[1]; c2 = argv[2];
+        vertical = (argc >= 4) ? argv[3] : Qnil;
+        rx = NUM2INT(rb_funcall(vr, rb_intern("x"), 0));
+        ry = NUM2INT(rb_funcall(vr, rb_intern("y"), 0));
+        rw = NUM2INT(rb_funcall(vr, rb_intern("width"), 0));
+        rh = NUM2INT(rb_funcall(vr, rb_intern("height"), 0));
+    } else {
+        VALUE vx, vy, vw, vh;
+        rb_scan_args(argc, argv, "61", &vx, &vy, &vw, &vh, &c1, &c2, &vertical);
+        rx = NUM2INT(vx); ry = NUM2INT(vy);
+        rw = NUM2INT(vw); rh = NUM2INT(vh);
+    }
     int r1, g1, b1, a1, r2, g2, b2, a2;
     get_color_rgba(c1, &r1, &g1, &b1, &a1);
     get_color_rgba(c2, &r2, &g2, &b2, &a2);

@@ -14,6 +14,7 @@
 | M5-o | 自动图块 48 形状表解码+实装（三表抠取、kind→几何/动画/镜像、普通块路径、层0 阴影条；A4 墙实测 near 100%，全屏 exact 50.1%/near 80.8%，菱形点阵消失） | ✅ 完成（2026-10-28/29，见 docs/analysis/rgss2/M5-o_自动图块48形状表_只读解码.md） |
 | M5-p | 双遍 ☆ 模式与 flash_data 解码+实装（obj0/obj1、☆=passages bit0x10、compose 拆两遍；flash 0x10096920 mode2 核 = 加色饱和 + F[裁剪宽度] 系数；本游戏均不触发，按解码待命） | ✅ 完成（2026-10-29，见 docs/analysis/rgss2/M5-p_双遍位图模式与flash_data_只读解码.md） |
 | M6 | 自动对照测试 + 研究文档 + 地址映射表 | ⬜ 未开始 |
+| B60 | 新测试游戏"草泥马历险记"首轮对拍：修复 Graphics.width/height 缺失、gradient_fill_rect 双形式、图片路径 UTF-8 转换；RGSS Error 弹窗加全调用链+现场状态+落盘；Main 段后 eval 不执行的注入陷阱登记（缺陷 52/53） | ✅ 完成（2026-11-14，见差异清单 B60） |
 
 ## 当前状态（一句话）
 
