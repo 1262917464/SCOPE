@@ -32,7 +32,7 @@ CFLAGS += -I. -Iext -I$(RB) -I$(RB)/win32
 all: $(TARGET)
 
 $(OUTDIR):
-	mkdir -p $(OUTDIR)
+	mkdir -p $(subst \,/,$(OUTDIR))
 
 $(OUTDIR)/%.o: %.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@

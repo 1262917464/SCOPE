@@ -222,7 +222,11 @@ static VALUE rect_load(VALUE klass, VALUE str)
 }
 
 /* ================= Table ================= */
-typedef struct { int xsize, ysize, zsize; short *data; } TableVal;
+/* 原版 TableVal 布局（0x1000ec20 _dump / 0x1000ed50 [] 反汇编确证）:
+ * +0x08=维度数(arity) +0x0c=xsize +0x10=ysize +0x14=zsize
+ * +0x18=元素数 n +0x1c=data 指针。_dump 头 5 字段直取
+ * [+0x08,+0x0c,+0x10,+0x14,+0x18] = [dims,x,y,z,n]。 */
+typedef struct { int dims; int xsize, ysize, zsize; short *data; } TableVal;
 
 static void table_free(void *p)
 {
@@ -239,6 +243,7 @@ static VALUE table_initialize(int argc, VALUE *argv, VALUE self)
     VALUE vx, vy, vz;
     rb_scan_args(argc, argv, "12", &vx, &vy, &vz);
     TableVal *t = GET_TABLE(self);
+    t->dims = argc < 1 ? 1 : (argc > 3 ? 3 : argc);
     t->xsize = NIL_P(vx) ? 1 : NUM2INT(vx);
     t->ysize = NIL_P(vy) ? 1 : NUM2INT(vy);
     t->zsize = NIL_P(vz) ? 1 : NUM2INT(vz);
@@ -271,20 +276,16 @@ static VALUE table_aref(int argc, VALUE *argv, VALUE self)
 
 static VALUE table_aset(int argc, VALUE *argv, VALUE self)
 {
-    VALUE vx, vy, vz, vval;
     TableVal *t = GET_TABLE(self);
-    rb_scan_args(argc, argv, "22", &vx, &vy, &vz, &vval);
-    int x = NUM2INT(vx);
-    int y = 0, z = 0, val;
-    if (!NIL_P(vval)) {
-        y = NIL_P(vy) ? 0 : NUM2INT(vy);
-        z = NIL_P(vz) ? 0 : NUM2INT(vz);
-        val = NUM2INT(vval);
-    } else {
-        /* [x] = v 形式 */
-        val = NIL_P(vy) ? 0 : NUM2INT(vy);
-        y = z = 0;
-    }
+    /* 原版 0x1000ee30: argc == dims+1, 末参为值, 其余为索引
+     * t[x]=v / t[x,y]=v / t[x,y,z]=v 由 argc 区分 */
+    if (argc < 2 || argc > 4)
+        rb_raise(rb_eArgError, "wrong number of arguments (%d for %d)",
+                 argc, t->dims + 1);
+    int x = NUM2INT(argv[0]);
+    int y = argc > 2 ? NUM2INT(argv[1]) : 0;
+    int z = argc > 3 ? NUM2INT(argv[2]) : 0;
+    int val = NUM2INT(argv[argc - 1]);
     if (x < 0 || x >= t->xsize || y < 0 || y >= t->ysize || z < 0 || z >= t->zsize)
         return Qnil;
     if (!t->data) return Qnil;
@@ -302,13 +303,13 @@ static VALUE table_dump(VALUE self, VALUE depth)
     (void)depth;
     int n = table_size(t);
     VALUE s = rb_str_new(NULL, 20 + n * 2);
-    /* 格式: [20字节头][int16 数据] — 原版 _dump 布局 */
+    /* 头 5 字段 = [维度数, xsize, ysize, zsize, n]（原版 0x1000ec41-0x1000ec5b） */
     char *p = RSTRING(s)->ptr;
-    memcpy(p, &t->xsize, 4);
-    memcpy(p + 4, &t->ysize, 4);
-    memcpy(p + 8, &t->zsize, 4);
-    memcpy(p + 12, &n, 4);
-    memcpy(p + 16, &n, 4);   /* 原版有 20 字节头, 末 4 字节用途待定 */
+    memcpy(p, &t->dims, 4);
+    memcpy(p + 4, &t->xsize, 4);
+    memcpy(p + 8, &t->ysize, 4);
+    memcpy(p + 12, &t->zsize, 4);
+    memcpy(p + 16, &n, 4);
     if (t->data) memcpy(p + 20, t->data, (size_t)n * 2);
     return s;
 }
@@ -322,6 +323,7 @@ static VALUE table_load(VALUE klass, VALUE str)
     const char *p = RSTRING(str)->ptr;
     int ndims = 0;
     memcpy(&ndims, p, 4);
+    t->dims = ndims < 1 ? 1 : (ndims > 3 ? 3 : ndims);
     memcpy(&t->xsize, p + 4, 4);
     memcpy(&t->ysize, p + 8, 4);
     memcpy(&t->zsize, p + 12, 4);

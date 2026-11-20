@@ -16,7 +16,7 @@ LDLIBS ?= -luser32 -lgdi32 -lwinmm
 
 # ---- 探针（probe/）----
 PROBES := iat_probe keytest blinkprobe cursortest probe_input_consts probe_input2 \
-          rgss_introspect rgss_introspect2 smoke difftest
+          rgss_introspect rgss_introspect2 smoke difftest tdump
 # 跳过记录（G5）：RGSS1_probelog.c 为 WinMain 入口（原仅编 .o 未出 exe），不在本表内
 
 # ---- 验证（verify/）----
